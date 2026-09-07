@@ -240,6 +240,19 @@ type SchedulerSettings struct {
 
 type FifoConfig struct {
 	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+
+	// PATCH(v255): queueing for over-limit requests
+	// QueueDepth is the number of requests that may wait in the queue while a
+	// model is at its concurrency limit. nil means the default of 10; 0
+	// disables queueing entirely and over-limit requests are rejected with 429
+	// as before. The queue depth is a single global value applied to each
+	// model's own queue (capacity = concurrencyLimit + queueDepth per model).
+	QueueDepth *int `yaml:"queueDepth"`
+
+	// QueueTimeout is how long (in seconds) an over-limit request may wait in
+	// the queue before it is rejected with 429 + Retry-After. nil means the
+	// default of 60; 0 disables the timeout and waits indefinitely.
+	QueueTimeout *int `yaml:"queueTimeout"`
 }
 
 type RouterConfig struct {

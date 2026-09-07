@@ -34,6 +34,28 @@ func (s *stubPlanner) EvictionFor(target string, _ []string) []string {
 
 func (s *stubPlanner) OnSwapStart(string, []string) {}
 
+// evictIfRunningPlanner returns an eviction list only while the eviction
+// candidate is in the running set — modelling a shared-GPU setup where loading
+// a target stops a sibling only once that sibling is actually running.
+type evictIfRunningPlanner struct {
+	evict map[string]string // target -> candidate to evict when running
+}
+
+func (p *evictIfRunningPlanner) EvictionFor(target string, running []string) []string {
+	cand, ok := p.evict[target]
+	if !ok {
+		return nil
+	}
+	for _, r := range running {
+		if r == cand {
+			return []string{cand}
+		}
+	}
+	return nil
+}
+
+func (p *evictIfRunningPlanner) OnSwapStart(string, []string) {}
+
 // grantRec is one GrantError / GrantServe call. err!=nil marks an error grant;
 // otherwise it is a serve grant and serve reports whether the caller received it.
 type grantRec struct {
@@ -160,6 +182,42 @@ func reqCh(model string) HandlerReq {
 	r := req(model)
 	r.Respond = make(chan HandlerResp, 1)
 	return r
+}
+
+// reqPos creates a HandlerReq that also listens for queue-position broadcasts.
+func reqPos(model string) HandlerReq {
+	r := reqCh(model)
+	r.PositionCh = make(chan int, 1)
+	return r
+}
+
+// queueDepthOff returns a FifoConfig with over-limit queueing disabled
+// (queueDepth=0), so a FIFO built from it keeps the legacy behavior: requests
+// over the concurrency limit are rejected at admission with 429.
+func queueDepthOff() config.FifoConfig {
+	zero := 0
+	return config.FifoConfig{QueueDepth: &zero}
+}
+
+// queueTimeoutInfinite returns a pointer to 0, an explicitly configured
+// infinite queue timeout. Queueing tests that do not exercise the timeout use
+// it so they stay independent of the default 60s queueTimeout.
+func queueTimeoutInfinite() *int {
+	zero := 0
+	return &zero
+}
+
+// queuePosition reads the latest broadcast queue position, failing the test if
+// none was sent.
+func queuePosition(t *testing.T, req HandlerReq) int {
+	t.Helper()
+	select {
+	case pos := <-req.PositionCh:
+		return pos
+	default:
+		t.Fatal("no queue position broadcast")
+		return -1
+	}
 }
 
 func admitErr(t *testing.T, req HandlerReq) error {
@@ -635,7 +693,7 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 
 	got := make([]string, len(s.queued))
 	for i, q := range s.queued {
-		got[i] = q.Model
+		got[i] = q.Req.Model
 	}
 	want := []string{"A", "B", "C", "D"}
 	if len(got) != len(want) {
@@ -744,15 +802,22 @@ func newFIFOWithLimit(t *testing.T, model string, limit int) (*FIFO, *fakeEffect
 	models := map[string]config.ModelConfig{
 		model: {ConcurrencyLimit: limit},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
 	return s, eff
 }
 
-// TestFIFO_ConcurrencyLimit_RejectsOverLimit verifies that a request arriving
-// while the model is at capacity gets rejected during admission, before it can
-// be queued or served, and that a new request succeeds once capacity returns.
+// TestFIFO_ConcurrencyLimit_RejectsOverLimit verifies that with queueing
+// explicitly disabled (queueDepth=0) a request arriving while the model is at
+// capacity is rejected during admission, before it can be queued or served, and
+// that a new request succeeds once capacity returns. This is the legacy
+// upstream regression path.
 func TestFIFO_ConcurrencyLimit_RejectsOverLimit(t *testing.T) {
-	s, eff := newFIFOWithLimit(t, "a", 1)
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 1},
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff)
 
 	// First request: served (inFlight 0 → 1).
 	r1 := req("a")
@@ -781,7 +846,9 @@ func TestFIFO_ConcurrencyLimit_RejectsOverLimit(t *testing.T) {
 }
 
 // TestFIFO_ConcurrencyLimit_DefaultIsTen verifies that a model without an
-// explicit ConcurrencyLimit gets the default cap of 10.
+// explicit ConcurrencyLimit gets the default cap of 10, and that with queueing
+// enabled (the default queueDepth=10) requests 11-20 wait in the queue while
+// the 21st overflows limit+queueDepth and is rejected.
 func TestFIFO_ConcurrencyLimit_DefaultIsTen(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateReady
@@ -797,17 +864,29 @@ func TestFIFO_ConcurrencyLimit_DefaultIsTen(t *testing.T) {
 		t.Fatalf("served(a)=%d want 10 (default limit)", got)
 	}
 
-	// 11th request is rejected.
+	// With queueing enabled, the next 10 requests are admitted and queue
+	// instead of being rejected.
+	for i := 0; i < 10; i++ {
+		r := req("a")
+		s.OnRequest(r)
+		assertAdmitted(t, r)
+	}
+	if got := len(s.queued); got != 10 {
+		t.Fatalf("queue len=%d want 10 (default queue depth)", got)
+	}
+
+	// 21st request overflows limit + queueDepth: rejected at admission.
 	r := req("a")
 	s.OnRequest(r)
 	assertAdmission429(t, r)
 	if got := eff.errored("a"); got != 0 {
-		t.Fatalf("errored(a)=%d want 0 (over default limit rejects before grant)", got)
+		t.Fatalf("errored(a)=%d want 0 (over limit+queueDepth rejects before grant)", got)
 	}
 }
 
-// TestFIFO_ConcurrencyLimit_CustomLimit verifies a ConcurrencyLimit greater
-// than zero overrides the default.
+// TestFIFO_ConcurrencyLimit_CustomLimit verifies that with queueing enabled a
+// ConcurrencyLimit greater than zero overrides the default, and an over-limit
+// request queues and is served as soon as a slot frees.
 func TestFIFO_ConcurrencyLimit_CustomLimit(t *testing.T) {
 	s, eff := newFIFOWithLimit(t, "a", 2)
 
@@ -819,26 +898,36 @@ func TestFIFO_ConcurrencyLimit_CustomLimit(t *testing.T) {
 	s.OnRequest(r3)
 	assertAdmitted(t, r1)
 	assertAdmitted(t, r2)
-	assertAdmission429(t, r3)
+	assertAdmitted(t, r3)
 
 	if got := eff.served("a"); got != 2 {
 		t.Fatalf("served(a)=%d want 2 (custom limit)", got)
 	}
-	if got := eff.errored("a"); got != 0 {
-		t.Fatalf("errored(a)=%d want 0 (over custom limit rejects before grant)", got)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (over-limit request queues)", got)
+	}
+
+	// One completion frees a serving slot; the queued request is served
+	// immediately even though the other in-flight request continues.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 after a slot frees", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
 	}
 }
 
-// TestFIFO_ConcurrencyLimit_SwapWaiters verifies that when more swap waiters
-// exist than the concurrency limit, excess waiters are rejected during
-// admission rather than after the loading stream has started.
+// TestFIFO_ConcurrencyLimit_SwapWaiters verifies that with queueing disabled
+// (queueDepth=0) more swap waiters than the concurrency limit are rejected
+// during admission rather than joining the in-flight swap or being queued.
 func TestFIFO_ConcurrencyLimit_SwapWaiters(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateStopped
 	models := map[string]config.ModelConfig{
 		"a": {ConcurrencyLimit: 2},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff)
 
 	// Three requests arrive while model is loading: one starts swap, two join.
 	r1 := req("a")
@@ -878,7 +967,9 @@ func TestFIFO_ConcurrencyLimit_QueuedWaitersReserveCapacity(t *testing.T) {
 		"a": {ConcurrencyLimit: 2},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	// Queueing disabled so an over-reserved waiter is rejected up front
+	// instead of queueing, keeping this test focused on swap reservation.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff)
 
 	bReq := req("b")
 	aReq1 := req("a")
@@ -924,7 +1015,9 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		"a": {ConcurrencyLimit: 1},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	// Queueing disabled so the rejected waiter is a pure admission rejection,
+	// exercising the legacy reservation-release path on cancel.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff)
 
 	bReq := req("b")
 	cancelledReq := reqCh("a")
@@ -944,5 +1037,405 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 
 	if got := len(s.queued); got != 1 {
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
+	}
+}
+
+// PATCH(v255) queueing for over-limit requests: the tests below cover the new
+// capacity-queueing behavior in the default-on mode.
+
+// TestFIFO_Queueing_OverLimitQueuesAndServesInOrder verifies that over-limit
+// requests queue (with queue positions) instead of being rejected, and are
+// served FIFO as serving slots free up one by one.
+func TestFIFO_Queueing_OverLimitQueuesAndServesInOrder(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 1)
+
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+
+	// Over-limit requests queue instead of being rejected.
+	r2 := reqPos("a")
+	r3 := reqPos("a")
+	s.OnRequest(r2)
+	s.OnRequest(r3)
+	assertAdmitted(t, r2)
+	assertAdmitted(t, r3)
+	if got := len(s.queued); got != 2 {
+		t.Fatalf("queue len=%d want 2", got)
+	}
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (queued, not rejected)", got)
+	}
+
+	// Positions were broadcast: r2 is #1, r3 is #2.
+	if pos := queuePosition(t, r2); pos != 1 {
+		t.Errorf("r2 position=%d want 1", pos)
+	}
+	if pos := queuePosition(t, r3); pos != 2 {
+		t.Errorf("r3 position=%d want 2", pos)
+	}
+
+	// Each serve completion frees one slot for the next waiter, in FIFO order.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 after first completion", got)
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (r3 still waiting)", got)
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 after second completion", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Queueing_QueueFullRejects429 verifies the hard cap: once
+// limit + queueDepth reservations are taken, the next request is rejected at
+// admission with 429.
+func TestFIFO_Queueing_QueueFullRejects429(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	one := 1
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &one, QueueTimeout: queueTimeoutInfinite()}, models, eff)
+
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1) // served, reserved=1
+
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertAdmitted(t, r2) // queued, reserved=2 = limit+queueDepth
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	r3 := req("a")
+	s.OnRequest(r3)
+	assertAdmission429(t, r3)
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0 (rejected before grant)", got)
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (r3 must not queue)", got)
+	}
+}
+
+// TestFIFO_Queueing_TimeoutRejects429 verifies the lazy-queue-timeout: a queued
+// waiter is pruned with a 429 ConcurrencyLimitError once its deadline passes,
+// releasing its reservation. Pruning only happens at a drain trigger.
+func TestFIFO_Queueing_TimeoutRejects429(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 1},
+		"b": {},
+	}
+	one := 1
+	cfg := config.FifoConfig{QueueDepth: &one, QueueTimeout: &one}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
+
+	// b's swap completion is the drain trigger that happens to run without
+	// freeing a's serving slot.
+	bReq := req("b")
+	s.OnRequest(bReq) // StartSwap(b)
+
+	r1 := req("a")
+	s.OnRequest(r1) // fast-path, inFlight[a]=1, reserved[a]=1
+	assertAdmitted(t, r1)
+
+	r2 := reqCh("a")
+	s.OnRequest(r2) // over limit -> queued with a 1s deadline
+	assertAdmitted(t, r2)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	// A drain before the deadline must not prune the waiter.
+	s.drainQueue()
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 before deadline", got)
+	}
+
+	// Let the deadline pass, then trigger the lazy drain via b's swap done.
+	time.Sleep(1100 * time.Millisecond)
+	eff.states["b"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after timeout drain", got)
+	}
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 (r2 must not be served)", got)
+	}
+	var httpErr swaputil.HTTPError
+	if !errors.As(eff.grants[len(eff.grants)-1].err, &httpErr) {
+		t.Fatalf("timeout error=%v want HTTPError", eff.grants[len(eff.grants)-1].err)
+	}
+	if httpErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode()=%d want 429", httpErr.StatusCode())
+	}
+	if httpErr.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After header")
+	}
+	// r2's reservation was released: only r1's remains.
+	if got := s.reserved["a"]; got != 1 {
+		t.Fatalf("reserved[a]=%d want 1 after timeout", got)
+	}
+}
+
+// TestFIFO_Queueing_CancelReleasesSlot verifies OnCancel prunes a queued
+// capacity waiter and returns its reservation, so later requests can be served.
+func TestFIFO_Queueing_CancelReleasesSlot(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 1)
+
+	r1 := req("a")
+	s.OnRequest(r1) // fast-path, inFlight[a]=1, reserved[a]=1
+	assertAdmitted(t, r1)
+
+	r2 := reqCh("a")
+	s.OnRequest(r2) // over limit -> queued, reserved[a]=2
+	assertAdmitted(t, r2)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	s.OnCancel(r2)
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after cancel", got)
+	}
+	if got := s.reserved["a"]; got != 1 {
+		t.Fatalf("reserved[a]=%d want 1 (only r1's slot remains)", got)
+	}
+
+	// r1 finishes; a new request is then served directly.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	r3 := req("a")
+	s.OnRequest(r3)
+	assertAdmitted(t, r3)
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Queueing_OnServeDoneDrainsWhileInFlight verifies the serve-done
+// path: with capacity waiters queued, every serve completion drains the queue
+// even when the model still has other requests in flight.
+func TestFIFO_Queueing_OnServeDoneDrainsWhileInFlight(t *testing.T) {
+	s, eff := newFIFOWithLimit(t, "a", 2)
+
+	r1 := req("a")
+	r2 := req("a")
+	s.OnRequest(r1)
+	s.OnRequest(r2)
+	assertAdmitted(t, r1)
+	assertAdmitted(t, r2)
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+
+	r3 := req("a")
+	s.OnRequest(r3) // over limit -> queued
+	assertAdmitted(t, r3)
+
+	// One completion frees a serving slot while r2 is still in flight; the
+	// queued waiter is served immediately instead of waiting for inFlight==0.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 while one request is still in flight", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after drain", got)
+	}
+
+	// Same for the next waiter.
+	r4 := req("a")
+	s.OnRequest(r4)
+	assertAdmitted(t, r4)
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 4 {
+		t.Fatalf("served(a)=%d want 4", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Queueing_OverLimitWaiterDoesNotJoinSwap verifies the capacity branch
+// runs before the in-flight-swap join: a request arriving after the limit is
+// reached queues instead of joining, so swap completion can never grant more
+// waiters than the model's concurrency limit (in-flight stays <= limit).
+func TestFIFO_Queueing_OverLimitWaiterDoesNotJoinSwap(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
+
+	r1 := req("a")
+	r2 := req("a")
+	r3 := req("a")
+	s.OnRequest(r1)
+	s.OnRequest(r2)
+	s.OnRequest(r3)
+	assertAdmitted(t, r1)
+	assertAdmitted(t, r2)
+	assertAdmitted(t, r3)
+	if sw := s.active["a"]; len(sw.waiters) != 2 {
+		t.Fatalf("waiters=%d want 2 (r3 must not join the swap)", len(sw.waiters))
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (r3 queued as capacity waiter)", got)
+	}
+
+	// Swap completes: only r1 and r2 are granted (inFlight=2=limit).
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (r3 still queued at capacity)", got)
+	}
+
+	// One waiter finishes: r3 is served while the other is still in flight.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 after one completion", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Queueing_JoinGateCountsInFlight is the H1 regression: a swap can be
+// in flight for a model that is STILL serving requests (the swap only stops a
+// sibling). During that window the drain-time join gate must count both the
+// existing waiters and the in-flight serving, otherwise OnSwapDone grants every
+// waiter at once and in-flight exceeds the concurrency limit.
+func TestFIFO_Queueing_JoinGateCountsInFlight(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+		"b": {},
+	}
+	// Loading a evicts b only once b is running; start with b stopped so r1
+	// serves a on the fast path.
+	planner := &evictIfRunningPlanner{evict: map[string]string{"a": "b"}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
+
+	// r1 is served while b is stopped and stays in flight.
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+
+	// b starts running; r2 now swaps a (evicting b) with r1 still serving, so
+	// reserved=2=limit and the swap is in flight with inFlight[a]=1.
+	eff.states["b"] = process.StateReady
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if got := eff.startsFor("a"); got != 1 {
+		t.Fatalf("StartSwap(a)=%d want 1", got)
+	}
+	if sw := s.active["a"]; sw == nil || len(sw.waiters) != 1 {
+		t.Fatalf("active swap waiters=%v want [r2]", sw)
+	}
+
+	// r3 arrives during the swap: a capacity waiter (reserved[a]=3 > limit=2).
+	r3 := reqCh("a")
+	s.OnRequest(r3)
+	assertAdmitted(t, r3)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	// A drain during the swap must NOT let r3 join: joining would push the
+	// post-completion in-flight to 1 (r1) + 2 (waiters) = 3 > limit=2.
+	s.drainQueue()
+	if sw := s.active["a"]; len(sw.waiters) != 1 {
+		t.Fatalf("waiters=%d want 1 (r3 must not join while r1 is in flight)", len(sw.waiters))
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 (r3 stays queued)", got)
+	}
+
+	// Swap completes: only r2 is granted; in-flight stays at the limit.
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2", got)
+	}
+	if got := s.inFlight["a"]; got != 2 {
+		t.Fatalf("inFlight[a]=%d want 2 (must not exceed limit)", got)
+	}
+
+	// r1 finishes; r3 is eventually servable — it swaps in (a still evicts b)
+	// and is granted on completion.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.startsFor("a"); got != 2 {
+		t.Fatalf("StartSwap(a)=%d want 2 (r3 swaps in once capacity frees)", got)
+	}
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 3 {
+		t.Fatalf("served(a)=%d want 3 (r3 eventually served)", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Queueing_QueueTimeoutNormalization verifies the queueTimeout
+// three-state semantics: nil defaults to 60s, explicit 0 waits indefinitely,
+// and a positive value is honored in seconds.
+func TestFIFO_Queueing_QueueTimeoutNormalization(t *testing.T) {
+	// nil -> default 60s: enqueuing an over-limit request stamps a deadline
+	// ~60s in the future rather than none.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	if got := s.queueTimeout; got != 60*time.Second {
+		t.Fatalf("queueTimeout=%v want default 60s", got)
+	}
+
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+	if d := s.queued[0].Deadline; d.IsZero() {
+		t.Fatal("queued deadline is zero, want default 60s from now")
+	} else if wait := time.Until(d); wait < 59*time.Second || wait > 61*time.Second {
+		t.Fatalf("deadline in %v, want ~60s", wait)
+	}
+
+	// explicit 0 -> infinite (no deadline anywhere).
+	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, nil, newFakeEffects())
+	if got := s.queueTimeout; got != 0 {
+		t.Fatalf("queueTimeout=%v want 0 (infinite)", got)
+	}
+
+	// positive value honored in seconds.
+	five := 5
+	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: &five}, nil, newFakeEffects())
+	if got := s.queueTimeout; got != 5*time.Second {
+		t.Fatalf("queueTimeout=%v want 5s", got)
 	}
 }

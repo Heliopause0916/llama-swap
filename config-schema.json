@@ -844,6 +844,16 @@
                                             "additionalProperties": {
                                                 "type": "integer"
                                             }
+                                        },
+                                        "queueDepth": {
+                                            "type": "integer",
+                                            "description": "How many over-limit requests may wait in the queue. Default 10; 0 disables queueing and over-limit requests are rejected with 429.",
+                                            "default": 10
+                                        },
+                                        "queueTimeout": {
+                                            "type": "integer",
+                                            "description": "How long (seconds) an over-limit request may wait in the queue before being rejected with 429 + Retry-After. Default 60; 0 waits indefinitely.",
+                                            "default": 60
                                         }
                                     },
                                     "additionalProperties": false

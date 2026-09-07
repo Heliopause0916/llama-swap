@@ -565,8 +565,19 @@ func TestBaseRouter_ModelNotFound(t *testing.T) {
 
 func TestBaseRouter_ConcurrencyLimitRejectsBeforeLoadingStream(t *testing.T) {
 	sendLoading := true
+	// PATCH(v255): over-limit queueing defaults to ON, so this test explicitly
+	// disables it (queueDepth=0) to keep asserting the legacy 429 semantics:
+	// an over-limit request is rejected before any loading stream starts.
+	zero := 0
 	conf := config.Config{
 		HealthCheckTimeout: 5,
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{QueueDepth: &zero},
+				},
+			},
+		},
 		Models: map[string]config.ModelConfig{
 			"a": {ConcurrencyLimit: 2, SendLoadingState: &sendLoading},
 			"b": {},

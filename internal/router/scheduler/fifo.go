@@ -16,11 +16,31 @@ import (
 // the model config leaves concurrencyLimit unset.
 const defaultConcurrencyLimit = 10
 
+// PATCH(v255): queueing for over-limit requests
+// defaultQueueDepth is the default number of over-limit requests that may wait
+// in the queue per model before admission falls back to a 429 rejection.
+const defaultQueueDepth = 10
+
+// PATCH(v255): queueing for over-limit requests
+// defaultQueueTimeout bounds how long an over-limit request waits in the queue
+// before it is rejected with 429 + Retry-After (see FifoConfig.QueueTimeout).
+const defaultQueueTimeout = 60 * time.Second
+
 // activeSwap tracks one in-flight swap and the callers waiting on it.
 type activeSwap struct {
 	modelID string
 	evict   []string
 	waiters []HandlerReq
+}
+
+// PATCH(v255): queueing for over-limit requests
+// queuedItem is one slot in the scheduler queue: the request plus the deadline
+// after which a queued waiter is rejected with 429 (zero value = never expires).
+// The deadline is set at enqueue time and can never outlive the item, so no
+// timer or sweeper is needed.
+type queuedItem struct {
+	Req      HandlerReq
+	Deadline time.Time
 }
 
 // FIFO is the default scheduler. Requests are handled in a first-in, first-out order.
@@ -43,7 +63,11 @@ type FIFO struct {
 	active   map[string]*activeSwap
 	reserved map[string]int
 	inFlight map[string]int
-	queued   []HandlerReq
+	queued   []queuedItem
+
+	// PATCH(v255): queueing for over-limit requests
+	queueDepth   int           // 0 = disabled (legacy 429 behavior)
+	queueTimeout time.Duration // 0 = wait indefinitely
 }
 
 // NewFIFO builds a FIFO scheduler. Per-model concurrency limits are derived
@@ -59,6 +83,16 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		limits[id] = limit
 	}
 
+	// PATCH(v255): queueing for over-limit requests
+	qDepth := defaultQueueDepth
+	if cfg.QueueDepth != nil {
+		qDepth = *cfg.QueueDepth
+	}
+	qTimeout := defaultQueueTimeout
+	if cfg.QueueTimeout != nil {
+		qTimeout = time.Duration(*cfg.QueueTimeout) * time.Second
+	}
+
 	return &FIFO{
 		name:     name,
 		logger:   logger,
@@ -69,6 +103,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		active:   make(map[string]*activeSwap),
 		reserved: make(map[string]int),
 		inFlight: make(map[string]int),
+		// PATCH(v255): queueing for over-limit requests
+		queueDepth:   qDepth,
+		queueTimeout: qTimeout,
 	}
 }
 
@@ -104,6 +141,16 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// PATCH(v255): queueing for over-limit requests
+	// Capacity branch: the model has no free serving slot left, so park the
+	// request instead of rejecting it at admission. This must run before the
+	// in-flight-swap join so swap waiters can never exceed the limit.
+	if s.queueingEnabled() && s.reserved[req.Model] > s.limit(req.Model) {
+		s.logger.Debugf("%s: queueing over-limit request for model %s (reserved=%d limit=%d)", s.name, req.Model, s.reserved[req.Model], s.limit(req.Model))
+		s.enqueue(req, s.deadline())
+		return
+	}
+
 	// (2) Join an in-flight swap for the same model.
 	if sw, ok := s.active[req.Model]; ok {
 		s.logger.Debugf("%s: joining in-flight swap for model %s (%d waiters)", s.name, req.Model, len(sw.waiters)+1)
@@ -124,14 +171,14 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// (4) Collision with an in-flight swap — queue.
 	if collidesWith(req.Model, evict, s.active) {
 		s.logger.Debugf("%s: queuing request for model %s (collides with in-flight swap)", s.name, req.Model)
-		s.enqueue(req)
+		s.enqueue(req, s.deadline())
 		return
 	}
 
 	// (5) Would evict a busy process — queue until it drains.
 	if conflictsWithInFlight(evict, s.inFlight) {
 		s.logger.Debugf("%s: queuing request for model %s (would evict in-flight process)", s.name, req.Model)
-		s.enqueue(req)
+		s.enqueue(req, s.deadline())
 		return
 	}
 
@@ -152,9 +199,9 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, q := range s.queued {
-			if q.Respond == req.Respond {
+			if q.Req.Respond == req.Respond {
 				removed = true
-				s.release(q.Model)
+				s.release(q.Req.Model)
 				continue
 			}
 			kept = append(kept, q)
@@ -210,6 +257,15 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
+	// PATCH(v255): queueing for over-limit requests
+	// Drain on every serve completion while capacity waiters exist: a freed
+	// serving slot must go to the next queued request even when the model still
+	// has other requests in flight. Without capacity waiters keep the upstream
+	// "inFlight == 0" gate so swap-related queueing behaves exactly as before.
+	if s.hasCapacityWaiters() {
+		s.drainQueue()
+		return
+	}
 	if s.inFlight[ev.ModelID] <= 0 {
 		delete(s.inFlight, ev.ModelID)
 		s.drainQueue()
@@ -246,8 +302,8 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, w := range s.queued {
-			if targetSet[w.Model] {
-				s.grantError(w, unloadErr)
+			if targetSet[w.Req.Model] {
+				s.grantError(w.Req, unloadErr)
 				continue
 			}
 			kept = append(kept, w)
@@ -274,7 +330,7 @@ func (s *FIFO) OnShutdown(err error) {
 		}
 	}
 	for _, w := range s.queued {
-		s.grantError(w, err)
+		s.grantError(w.Req, err)
 	}
 }
 
@@ -306,7 +362,12 @@ func (s *FIFO) grantError(req HandlerReq, err error) {
 // one future serving slot until they serve, cancel while waiting, or receive a
 // post-admission error.
 func (s *FIFO) admit(req HandlerReq) bool {
-	if s.reserved[req.Model] >= s.limit(req.Model) {
+	// PATCH(v255): queueing for over-limit requests
+	capacity := s.limit(req.Model)
+	if s.queueingEnabled() {
+		capacity += s.queueDepth
+	}
+	if s.reserved[req.Model] >= capacity {
 		s.rejectAdmission(req, swaputil.ConcurrencyLimitError{})
 		return false
 	}
@@ -365,6 +426,35 @@ func (s *FIFO) limit(modelID string) int {
 	return defaultConcurrencyLimit
 }
 
+// PATCH(v255): queueing for over-limit requests
+// queueingEnabled reports whether over-limit requests queue instead of being
+// rejected at admission. queueDepth 0 disables queueing and restores the
+// legacy 429 behavior.
+func (s *FIFO) queueingEnabled() bool { return s.queueDepth > 0 }
+
+// PATCH(v255): queueing for over-limit requests
+// deadline returns the queue deadline for a newly enqueued request, or the zero
+// time when queueTimeout is not configured (wait indefinitely).
+func (s *FIFO) deadline() time.Time {
+	if s.queueTimeout <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(s.queueTimeout)
+}
+
+// PATCH(v255): queueing for over-limit requests
+// hasCapacityWaiters reports whether any queued request is waiting on a model
+// at its concurrency limit. While one exists, OnServeDone drains on every
+// completion so a freed serving slot is handed over immediately.
+func (s *FIFO) hasCapacityWaiters() bool {
+	for _, item := range s.queued {
+		if s.queueingEnabled() && s.reserved[item.Req.Model] >= s.limit(item.Req.Model) {
+			return true
+		}
+	}
+	return false
+}
+
 // startSwap records the swap as active and launches it via Effects. running is
 // the set EvictionFor saw, forwarded to OnSwapStart so the planner logs against
 // the same picture it decided on.
@@ -382,18 +472,18 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 // first queued item whose priority is strictly lower, so higher-priority models
 // are serviced first while equal-priority requests keep their arrival (FIFO)
 // order. Priorities come from the FifoConfig; unlisted models default to 0.
-func (s *FIFO) enqueue(req HandlerReq) {
+func (s *FIFO) enqueue(req HandlerReq, deadline time.Time) {
 	p := s.cfg.Priority[req.Model]
 	i := len(s.queued)
 	for j, q := range s.queued {
-		if s.cfg.Priority[q.Model] < p {
+		if s.cfg.Priority[q.Req.Model] < p {
 			i = j
 			break
 		}
 	}
-	s.queued = append(s.queued, HandlerReq{})
+	s.queued = append(s.queued, queuedItem{})
 	copy(s.queued[i+1:], s.queued[i:])
-	s.queued[i] = req
+	s.queued[i] = queuedItem{Req: req, Deadline: deadline} // zero Deadline => never expires
 	broadcastQueuePositions(s.queued)
 }
 
@@ -406,14 +496,46 @@ func (s *FIFO) drainQueue() {
 		return
 	}
 	pending := s.queued
-	var remaining []HandlerReq
-	for _, req := range pending {
+	var remaining []queuedItem
+	for _, item := range pending {
+		req := item.Req
+
+		// PATCH(v255): queueing for over-limit requests
+		// Lazy timeout: prune expired waiters first so their reservations are
+		// released and become visible to later items in this same drain.
+		if !item.Deadline.IsZero() && time.Now().After(item.Deadline) {
+			s.logger.Debugf("%s: over-limit queued request for model %s timed out", s.name, req.Model)
+			s.grantError(req, swaputil.ConcurrencyLimitError{RetryAfter: 1})
+			continue // grantError releases the reservation
+		}
+		// PATCH(v255): queueing for over-limit requests
+		// Capacity gate: no free serving slot for this model yet, stay queued.
+		// The gate counts in-flight, not reserved, because every queued item
+		// holds a reservation: a reserved-based gate would strand waiters
+		// behind their own reservations (a model at its limit with only queued
+		// waiters would never drain).
+		if s.queueingEnabled() && s.inFlight[req.Model] >= s.limit(req.Model) {
+			remaining = append(remaining, item)
+			continue
+		}
+
 		state, ok := s.effects.ModelState(req.Model)
 		if !ok {
 			s.grantError(req, ErrModelNotFound)
 			continue
 		}
 		if sw, ok := s.active[req.Model]; ok {
+			// PATCH(v255): queueing for over-limit requests
+			// Joining hands the request a serving slot at swap completion, so
+			// never let a drain-time join push the post-completion in-flight
+			// count over the model's limit: count current waiters AND the
+			// model's still-serving requests (a swap can be in flight while the
+			// same model keeps serving — e.g. it only evicts a sibling).
+			if s.queueingEnabled() &&
+				len(sw.waiters)+s.inFlight[req.Model] >= s.limit(req.Model) {
+				remaining = append(remaining, item)
+				continue
+			}
 			s.logger.Debugf("%s: queued request for model %s now joining in-flight swap", s.name, req.Model)
 			sw.waiters = append(sw.waiters, req)
 			continue
@@ -426,11 +548,11 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if collidesWith(req.Model, evict, s.active) {
-			remaining = append(remaining, req)
+			remaining = append(remaining, item)
 			continue
 		}
 		if conflictsWithInFlight(evict, s.inFlight) {
-			remaining = append(remaining, req)
+			remaining = append(remaining, item)
 			continue
 		}
 		s.logger.Debugf("%s: queued request for model %s now starting swap, evicting %v", s.name, req.Model, evict)
@@ -537,8 +659,9 @@ func containsString(xs []string, s string) bool {
 // broadcastQueuePositions sends each queued request its current 1-indexed
 // position. Sends are non-blocking: if the channel is full, the old value is
 // drained first so the consumer always sees the latest position.
-func broadcastQueuePositions(queued []HandlerReq) {
-	for i, req := range queued {
+func broadcastQueuePositions(queued []queuedItem) {
+	for i, item := range queued {
+		req := item.Req
 		pos := i + 1
 		select {
 		case req.PositionCh <- pos:
