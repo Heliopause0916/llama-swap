@@ -44,6 +44,7 @@ var captureFieldsByPath = map[string]captureFields{
 	"/v1/audio/transcriptions": captureReqHeaders | captureRespHeaders | captureRespBody,
 	"/v1/images/generations":   captureReqAll | captureRespHeaders,
 	"/v1/images/edits":         captureReqHeaders | captureRespHeaders,
+	"/v1/images/variations":    captureReqHeaders | captureRespHeaders,
 	"/sdapi/v1/txt2img":        captureReqAll | captureRespHeaders,
 	"/sdapi/v1/img2img":        captureReqHeaders | captureRespHeaders,
 }

@@ -155,6 +155,7 @@ var modelPostJSONRoutes = []string{
 var modelPostFormRoutes = []string{
 	"/v1/audio/transcriptions",
 	"/v1/images/edits",
+	"/v1/images/variations",
 }
 
 // modelGetRoutes are model-dispatched GET endpoints (the model arrives as a
