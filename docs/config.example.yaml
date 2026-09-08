@@ -694,6 +694,15 @@ routing:
         #   (see docs/design/request-priority.md)
         requestPriority: {}
 
+        # promoteAfter: request-priority aging (L1.5, docs/design/request-priority.md §17)
+        # - optional; nil or 0 = feature off (L1 behavior unchanged)
+        # - > 0 = a queued request waiting at least this many seconds is pinned
+        #   to the scheduler-internal top tier at the next drain, protecting
+        #   low-priority waiters from starvation
+        # - when enabled it must be smaller than the effective queueTimeout,
+        #   and band values must stay below 2147483647
+        # promoteAfter: 120
+
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary
 # - peers can be another llama-swap

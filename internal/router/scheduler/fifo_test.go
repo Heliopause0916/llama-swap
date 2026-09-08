@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -207,6 +208,54 @@ func reqPos(model string) HandlerReq {
 	r := reqCh(model)
 	r.PositionCh = make(chan int, 1)
 	return r
+}
+
+// promoteAfterPtr returns a pointer to n for FifoConfig.PromoteAfter,
+// mirroring the *int three-state vocabulary of QueueDepth / QueueTimeout.
+func promoteAfterPtr(n int) *int {
+	v := n
+	return &v
+}
+
+// fakeClock is a controllable time source for threshold-aging tests (D23):
+// tests advance it manually instead of sleeping against the wall clock. FIFOs
+// under test get it via newFIFOAging's s.now wiring.
+type fakeClock struct {
+	t time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Unix(1_700_000_000, 0)}
+}
+
+func (c *fakeClock) now() time.Time { return c.t }
+
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// newFIFOAging builds a FIFO from cfg with the fake clock wired in and returns
+// it together with the clock, so threshold-based aging is deterministic.
+func newFIFOAging(planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) (*FIFO, *fakeClock) {
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, models, eff)
+	clock := newFakeClock()
+	s.now = clock.now
+	return s, clock
+}
+
+// assertQueueOrder fails the test unless s.queued holds want's models in order.
+func assertQueueOrder(t *testing.T, s *FIFO, want []string) {
+	t.Helper()
+	got := make([]string, len(s.queued))
+	for i, item := range s.queued {
+		got[i] = item.Req.Model
+	}
+	if len(got) != len(want) {
+		t.Fatalf("queue=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("queue=%v want %v", got, want)
+		}
+	}
 }
 
 // queueDepthOff returns a FifoConfig with over-limit queueing disabled
@@ -1545,4 +1594,591 @@ func TestFIFO_Queueing_QueueTimeoutNormalization(t *testing.T) {
 	if got := s.queueTimeout; got != 5*time.Second {
 		t.Fatalf("queueTimeout=%v want 5s", got)
 	}
+}
+
+// --- TestFIFO_Aging_* — request-priority aging (docs/design/request-priority.md §17) ---
+
+// TestFIFO_Aging_PromotesAfterThreshold verifies the headline guarantee: a
+// low-priority request queued at t0 is pinned once its queue age reaches
+// promoteAfter, and is granted ahead of continuous high-priority arrivals even
+// though they arrived while it was still blocked (§17.1/§17.7).
+func TestFIFO_Aging_PromotesAfterThreshold(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "l", "h"} {
+		eff.states[m] = process.StateStopped
+	}
+	// z's swap blocks l and h into the queue; once z completes, l's swap evicts
+	// h so the aged low request is granted while the newer high stays queued.
+	planner := &stubPlanner{evict: map[string][]string{"z": {"l", "h"}, "l": {"h"}}}
+	s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+
+	s.OnRequest(req("z")) // startSwap(z, [l h]): everything else queues
+
+	l := reqP("l", 30) // aged low, EnqueuedAt = t0
+	s.OnRequest(l)
+	assertAdmitted(t, l)
+
+	// Continuous high-priority arrivals; the low request ages past the
+	// threshold while blocked.
+	clock.advance(3 * time.Second)
+	h := reqP("h", 100) // EnqueuedAt = t0+3s
+	s.OnRequest(h)
+	assertAdmitted(t, h)
+
+	// Drain past the threshold: l (age 6s >= 5s) is pinned ahead of h (age 3s);
+	// both are still blocked by z's swap, so the re-rank is purely on the queue.
+	clock.advance(3 * time.Second)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"l", "h"})
+
+	// z completes: l is granted (starts its swap, evicting h) while the newer
+	// high arrival remains queued behind l's in-flight swap.
+	eff.states["z"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "z"})
+	if got := eff.startsFor("l"); got != 1 {
+		t.Fatalf("StartSwap(l)=%d want 1 (aged low must be granted first)", got)
+	}
+	if got := len(s.queued); got != 1 || s.queued[0].Req.Model != "h" {
+		t.Fatalf("queue=%v want [h] still queued", s.queued)
+	}
+
+	// l completes its swap and serves; h then gets its chance.
+	eff.states["l"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "l"})
+	if got := eff.served("l"); got != 1 {
+		t.Fatalf("served(l)=%d want 1", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue=%v want empty after serving l", s.queued)
+	}
+}
+
+// TestFIFO_Aging_StableAmongPromoted verifies stability among promoted items:
+// two low requests promoted in *different* drains keep their arrival order —
+// the earlier-arrived one stays ranked before the later one — and both ride
+// above a newer high-band arrival (§17.7).
+func TestFIFO_Aging_StableAmongPromoted(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "x", "y", "h"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"x", "y", "h"}}}
+	s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+
+	s.OnRequest(req("z")) // blocker
+
+	x := reqP("x", 30) // EnqueuedAt = t0
+	s.OnRequest(x)
+	assertAdmitted(t, x)
+
+	clock.advance(4 * time.Second)
+	y := reqP("y", 30) // EnqueuedAt = t0+4s; same band so arrival order is kept
+	s.OnRequest(y)
+	assertAdmitted(t, y)
+
+	// First drain: x (age 6s) is pinned; y (age 2s) is not yet.
+	clock.advance(2 * time.Second)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"x", "y"})
+
+	// A newer high-band request arrives mid-flight; the second drain promotes y
+	// too (age 7s). Stability keeps [x, y] ahead of h (age 2s).
+	clock.advance(3 * time.Second)
+	h := reqP("h", 100)
+	s.OnRequest(h)
+	assertAdmitted(t, h)
+	clock.advance(2 * time.Second)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"x", "y", "h"})
+}
+
+// TestFIFO_Aging_LateHighPinnedSortsAfterEarlyLow is the lock-in lemma
+// regression (§17.7): a later high-band arrival y is band-inserted *ahead* of
+// the earlier low request x, then y itself ages to pinned. The re-rank's dual
+// key (eff desc, EnqueuedAt asc) must keep x — the earlier arrival — ahead of
+// y: rank(x) stays monotone. A pure stable sort would preserve the band-insert
+// order [y, x] and violate the lemma.
+func TestFIFO_Aging_LateHighPinnedSortsAfterEarlyLow(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "x", "y", "h"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"x", "y", "h"}}}
+	s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+
+	s.OnRequest(req("z")) // blocker keeps everything queued
+
+	x := reqP("x", 30) // EnqueuedAt = t0
+	s.OnRequest(x)
+	assertAdmitted(t, x)
+
+	// Late high-band arrival: the band insert places y before x.
+	clock.advance(time.Second)
+	y := reqP("y", 100) // EnqueuedAt = t0+1s
+	s.OnRequest(y)
+	assertAdmitted(t, y)
+	assertQueueOrder(t, s, []string{"y", "x"})
+
+	// Both aged past promoteAfter (x 6s, y 5s): pinned in the same drain. The
+	// explicit arrival-order tie-break puts x first — the pre-drain [y, x]
+	// order must NOT survive a stable-only re-rank.
+	clock.advance(5 * time.Second)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"x", "y"})
+
+	// Lock-in holds across a later drain: a new high arrival cannot overtake x.
+	clock.advance(2 * time.Second)
+	h := reqP("h", 100)
+	s.OnRequest(h)
+	assertAdmitted(t, h)
+	s.drainQueue()
+	if got := s.queued[0].Req.Model; got != "x" {
+		t.Fatalf("queue head=%s want x after later drain (lock-in violated)", got)
+	}
+}
+
+// TestFIFO_Aging_PromotedNeverOvertaken verifies the lock-in lemma (§17.7):
+// once an item is pinned, its queue rank is monotone non-increasing across
+// later drains while newer high-priority arrivals keep arriving.
+func TestFIFO_Aging_PromotedNeverOvertaken(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "x", "h1", "h2", "h3"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"x", "h1", "h2", "h3"}}}
+	s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+
+	s.OnRequest(req("z")) // blocker keeps x queued the whole test
+	x := reqP("x", 30)
+	s.OnRequest(x)
+	assertAdmitted(t, x)
+
+	// First drain pins x.
+	clock.advance(6 * time.Second)
+	s.drainQueue()
+	if got := s.queued[0].Req.Model; got != "x" {
+		t.Fatalf("queue head=%s want x after first drain", got)
+	}
+
+	// New high-band arrivals keep coming; x's rank never slips.
+	for i := 1; i <= 3; i++ {
+		clock.advance(2 * time.Second)
+		n := reqP(fmt.Sprintf("h%d", i), 100)
+		s.OnRequest(n)
+		assertAdmitted(t, n)
+		s.drainQueue()
+		if pos := queuePositionOf(s.queued, "x"); pos != 0 {
+			t.Fatalf("iteration %d: pinned request overtaken (position %d); queue=%v", i, pos, s.queued)
+		}
+		if got := s.queued[0].Req.Model; got != "x" {
+			t.Fatalf("iteration %d: queue head=%s want x (lock-in violated)", i, got)
+		}
+	}
+}
+
+// queuePositionOf returns the 0-indexed position of the first queued item with
+// the given model, or -1.
+func queuePositionOf(queued []queuedItem, model string) int {
+	for i, item := range queued {
+		if item.Req.Model == model {
+			return i
+		}
+	}
+	return -1
+}
+
+// agingFeatureOffScenario is the shared L1 baseline scenario for the feature-
+// off rows: with promoteAfter nil or 0, an aged low request must NOT be
+// promoted — drain order stays the L1 resolved-band order and the grant
+// sequence is unchanged (§17.4 zero-cost claim).
+func agingFeatureOffScenario(t *testing.T, cfg config.FifoConfig) {
+	t.Helper()
+	// The clock is advanced by minutes to prove aging would have fired; an
+	// infinite queueTimeout keeps the default 60s lazy prune out of the way.
+	cfg.QueueTimeout = queueTimeoutInfinite()
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "low", "high"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"low", "high"}}}
+	s, clock := newFIFOAging(planner, cfg, nil, eff)
+
+	s.OnRequest(req("z")) // blocker
+	low := reqP("low", 30)
+	s.OnRequest(low)
+	assertAdmitted(t, low)
+	clock.advance(time.Second)
+	high := reqP("high", 100)
+	s.OnRequest(high)
+	assertAdmitted(t, high)
+	// L1 enqueue order: high before low.
+	assertQueueOrder(t, s, []string{"high", "low"})
+
+	// Ten minutes pass: had aging run, the low request would be pinned. With
+	// the feature off, the drain leaves the L1 order untouched.
+	clock.advance(10 * time.Minute)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"high", "low"})
+
+	// Grant sequence is unchanged too: the blocker completes and high is
+	// serviced first in the same single-pass drain.
+	eff.states["z"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "z"})
+	if got := eff.startsFor("high"); got != 1 {
+		t.Fatalf("StartSwap(high)=%d want 1 (L1 order: high serviced first)", got)
+	}
+	if got := eff.startsFor("low"); got != 1 {
+		t.Fatalf("StartSwap(low)=%d want 1 (L1 order: low serviced second)", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after blocker completes", got)
+	}
+}
+
+// TestFIFO_Aging_FeatureOffNil verifies promoteAfter unset keeps drainQueue
+// byte-for-byte L1: no re-rank path, L1 ordering and grant sequence intact.
+func TestFIFO_Aging_FeatureOffNil(t *testing.T) {
+	agingFeatureOffScenario(t, config.FifoConfig{})
+}
+
+// TestFIFO_Aging_FeatureOffZero verifies an explicit promoteAfter: 0 disables
+// the feature exactly like nil.
+func TestFIFO_Aging_FeatureOffZero(t *testing.T) {
+	agingFeatureOffScenario(t, config.FifoConfig{PromoteAfter: promoteAfterPtr(0)})
+}
+
+// TestFIFO_Aging_CancelDoesNotAge verifies an aged-but-cancelled request is
+// pruned by OnCancel: it is never granted and its reservation is released, so
+// a later drain finds nothing to promote (§17.4 removal paths unchanged).
+func TestFIFO_Aging_CancelDoesNotAge(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	cfg := config.FifoConfig{PromoteAfter: promoteAfterPtr(5), QueueTimeout: queueTimeoutInfinite()}
+	s, clock := newFIFOAging(&stubPlanner{}, cfg, models, eff)
+
+	r1 := req("a") // fast path: occupies the single slot
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+
+	r2 := reqCh("a") // capacity waiter, EnqueuedAt = t0
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	clock.advance(10 * time.Second) // r2's age far exceeds promoteAfter
+	s.OnCancel(r2)
+
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after cancel", got)
+	}
+	if got := s.reserved["a"]; got != 1 {
+		t.Fatalf("reserved[a]=%d want 1 (only r1's reservation remains)", got)
+	}
+
+	// A subsequent drain must not grant or error the cancelled request.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1", got)
+	}
+	if got := eff.errored("a"); got != 0 {
+		t.Fatalf("errored(a)=%d want 0", got)
+	}
+}
+
+// TestFIFO_Aging_SkipKeepsEnqueuedAt verifies D19: an item skipped across
+// several drains (collision block, then capacity interplay) keeps its original
+// EnqueuedAt — wait time accrues continuously, so a long block cannot "forgive"
+// the aging countdown.
+func TestFIFO_Aging_SkipKeepsEnqueuedAt(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "x", "h"} {
+		eff.states[m] = process.StateStopped
+	}
+	// z blocks x and h; once z completes, x's swap evicts h.
+	planner := &stubPlanner{evict: map[string][]string{"z": {"x", "h"}, "x": {"h"}}}
+	cfg := config.FifoConfig{PromoteAfter: promoteAfterPtr(5), QueueTimeout: queueTimeoutInfinite()}
+	s, clock := newFIFOAging(planner, cfg, nil, eff)
+
+	s.OnRequest(req("z"))
+	t0 := clock.now()
+	x := reqP("x", 30)
+	s.OnRequest(x)
+	assertAdmitted(t, x)
+
+	// Two drains while the collision block persists: x is skipped each time.
+	clock.advance(2 * time.Second)
+	s.drainQueue()
+	clock.advance(2 * time.Second)
+	s.drainQueue()
+	if got := s.queued[0]; !got.EnqueuedAt.Equal(t0) || got.Req.Model != "x" {
+		t.Fatalf("queued[0]=%+v want x with EnqueuedAt=%v (never reset, D19)", got, t0)
+	}
+
+	// Age has passed the threshold; a newer high arrival cannot overtake.
+	clock.advance(2 * time.Second) // age(x) = 6s >= 5s
+	h := reqP("h", 100)
+	s.OnRequest(h)
+	assertAdmitted(t, h)
+	s.drainQueue()
+	assertQueueOrder(t, s, []string{"x", "h"})
+	if got := s.queued[0].EnqueuedAt; !got.Equal(t0) {
+		t.Fatalf("EnqueuedAt=%v want original %v after re-rank", got, t0)
+	}
+
+	// Unblock: x (promoted via continuous age) starts its swap first; h (young,
+	// high band) collides with x's swap and stays queued.
+	eff.states["z"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "z"})
+	if got := eff.startsFor("x"); got != 1 {
+		t.Fatalf("StartSwap(x)=%d want 1 (continuous age must promote x)", got)
+	}
+	if got := len(s.queued); got != 1 || s.queued[0].Req.Model != "h" {
+		t.Fatalf("queue=%v want [h] still queued", s.queued)
+	}
+}
+
+// TestFIFO_Aging_JoinExitsScope verifies a queued request that joins an
+// in-flight swap during a drain leaves the aging domain (§17.5): it is granted
+// at OnSwapDone and no further aging semantics apply to swap waiters.
+func TestFIFO_Aging_JoinExitsScope(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "a"} {
+		eff.states[m] = process.StateStopped
+	}
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	cfg := config.FifoConfig{PromoteAfter: promoteAfterPtr(5), QueueTimeout: queueTimeoutInfinite()}
+	s, clock := newFIFOAging(planner, cfg, models, eff)
+
+	s.OnRequest(req("z"))    // blocks a into the queue
+	higher := reqP("a", 100) // EnqueuedAt = t0
+	s.OnRequest(higher)
+	assertAdmitted(t, higher)
+	clock.advance(time.Second)
+	lower := reqP("a", 30) // EnqueuedAt = t0+1s
+	s.OnRequest(lower)
+	assertAdmitted(t, lower)
+
+	clock.advance(5 * time.Second) // both aged past promoteAfter
+
+	// z completes: the aged items start/join a swap for a in one drain.
+	eff.states["z"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "z"})
+	if sw := s.active["a"]; sw == nil {
+		t.Fatal("no active swap for a after z completes")
+	} else if len(sw.waiters) != 2 {
+		t.Fatalf("waiters=%d want 2 (one joined during the drain)", len(sw.waiters))
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 (both aged items left the queue)", got)
+	}
+
+	// Joining exits the aging scope: more time changes nothing for waiters.
+	clock.advance(time.Hour)
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 (both granted at swap completion)", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0", got)
+	}
+}
+
+// TestFIFO_Aging_CrossModelNoBlocking verifies §17.6: a pinned item of model A
+// that ranks first never blocks a satisfiable item of model B — B is still
+// granted in the same single-pass drain.
+func TestFIFO_Aging_CrossModelNoBlocking(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady // fast-path serving occupies A's slot
+	eff.states["b"] = process.StateStopped
+	eff.states["kick"] = process.StateStopped
+	models := map[string]config.ModelConfig{
+		"a":    {ConcurrencyLimit: 1},
+		"b":    {},
+		"kick": {},
+	}
+	planner := &stubPlanner{evict: map[string][]string{"kick": {"b"}}}
+	cfg := config.FifoConfig{PromoteAfter: promoteAfterPtr(5), QueueTimeout: queueTimeoutInfinite()}
+	s, clock := newFIFOAging(planner, cfg, models, eff)
+
+	r_a0 := req("a") // served and stays in flight, pinning A's slot
+	s.OnRequest(r_a0)
+	assertAdmitted(t, r_a0)
+
+	s.OnRequest(req("kick")) // kick's swap blocks b into the queue
+
+	rA := reqP("a", 30) // capacity waiter for A
+	s.OnRequest(rA)
+	assertAdmitted(t, rA)
+	rB := reqP("b", 30) // collision waiter for B
+	s.OnRequest(rB)
+	assertAdmitted(t, rB)
+
+	clock.advance(10 * time.Second) // both aged and pinned at the next drain
+	eff.states["kick"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "kick"})
+
+	// Single-pass drain: rA (pinned, ranks first) is blocked by A's in-flight
+	// slot; rB (pinned too) has free capacity and is granted in the same pass.
+	if got := eff.startsFor("b"); got != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1 (model B must not be blocked by A's pinned item)", got)
+	}
+	if got := len(s.queued); got != 1 || s.queued[0].Req.Model != "a" {
+		t.Fatalf("queue=%v want [a] still blocked", s.queued)
+	}
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 (only r_a0)", got)
+	}
+
+	// Once A's slot frees, the pinned waiter is served on the fast path (a is
+	// Ready and nothing needs evicting), not via a new swap.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if got := eff.served("a"); got != 2 {
+		t.Fatalf("served(a)=%d want 2 (rA served once A's slot frees)", got)
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue=%v want empty after rA served", s.queued)
+	}
+}
+
+// TestFIFO_Aging_QueuePositionEffective verifies §17.8: queue positions and
+// the PositionCh broadcasts reflect the effective order after the re-rank —
+// a promoted low request visibly moves to the front.
+func TestFIFO_Aging_QueuePositionEffective(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "high", "low"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"high", "low"}}}
+	s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+
+	s.OnRequest(req("z")) // blocker
+	rLow := reqPos("low")
+	rLow.Priority = 30
+	s.OnRequest(rLow) // EnqueuedAt = t0, queue position 1
+
+	// The high request arrives well after the low one, so at the drain only the
+	// low request's age meets the threshold.
+	clock.advance(6 * time.Second)
+	rHigh := reqPos("high")
+	rHigh.Priority = 100
+	s.OnRequest(rHigh) // EnqueuedAt = t0+6s, queue position 1 (inserted ahead by band)
+	assertQueueOrder(t, s, []string{"high", "low"})
+
+	clock.advance(4 * time.Second) // age(low) = 10s >= 5s; age(high) = 4s < 5s
+	s.drainQueue()
+
+	// PositionCh broadcasts: the promoted low request is now first.
+	if got := queuePosition(t, rLow); got != 1 {
+		t.Fatalf("low position=%d want 1 (front-lifted by aging)", got)
+	}
+	if got := queuePosition(t, rHigh); got != 2 {
+		t.Fatalf("high position=%d want 2", got)
+	}
+	// Queued() snapshot reflects the same effective order.
+	if got := s.Queued(); len(got) != 2 || got[0].Model != "low" || got[1].Model != "high" {
+		t.Fatalf("Queued()=%+v want [low, high] in effective order", got)
+	}
+}
+
+// TestFIFO_Aging_TimeoutPruneStillWins verifies the lazy timeout prune runs
+// before aging can grant anything: an item that is pinned (age >= promoteAfter)
+// is still dropped with 429 + Retry-After: 1 once its deadline passes, because
+// capacity never frees (§17.9 row 11).
+func TestFIFO_Aging_TimeoutPruneStillWins(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	one, ten, five := 1, 10, 5
+	cfg := config.FifoConfig{QueueDepth: &one, QueueTimeout: &ten, PromoteAfter: &five}
+	s, clock := newFIFOAging(&stubPlanner{}, cfg, models, eff)
+
+	r1 := req("a") // fast path, inFlight[a]=1, occupied forever
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	r2 := reqCh("a") // capacity waiter: deadline t0+10s, EnqueuedAt t0
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1", got)
+	}
+
+	// Pinned (age 7s >= 5s) but not expired: stays queued.
+	clock.advance(7 * time.Second)
+	s.drainQueue()
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queue len=%d want 1 before the deadline", got)
+	}
+
+	// Past the deadline (age 11s >= 5s): the lazy prune still wins.
+	clock.advance(4 * time.Second)
+	s.drainQueue()
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queue len=%d want 0 after the timeout drain", got)
+	}
+	if got := eff.served("a"); got != 1 {
+		t.Fatalf("served(a)=%d want 1 (r2 must not be served)", got)
+	}
+	var httpErr swaputil.HTTPError
+	if !errors.As(eff.grants[len(eff.grants)-1].err, &httpErr) {
+		t.Fatalf("timeout error=%v want HTTPError", eff.grants[len(eff.grants)-1].err)
+	}
+	if httpErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode()=%d want 429", httpErr.StatusCode())
+	}
+	if httpErr.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After header")
+	}
+	if got := s.reserved["a"]; got != 1 {
+		t.Fatalf("reserved[a]=%d want 1 (only r1's reservation remains)", got)
+	}
+}
+
+// TestFIFO_Aging_ClockBoundary verifies the >= semantics of the threshold
+// (row 12): an age just below promoteAfter does not promote, an age exactly
+// equal to it does.
+func TestFIFO_Aging_ClockBoundary(t *testing.T) {
+	t.Run("just below threshold", func(t *testing.T) {
+		// age(low) = 5s - 1ns < 5s: not promoted, high (100) stays first.
+		eff := newFakeEffects()
+		for _, m := range []string{"z", "low", "high"} {
+			eff.states[m] = process.StateStopped
+		}
+		planner := &stubPlanner{evict: map[string][]string{"z": {"low", "high"}}}
+		s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+		s.OnRequest(req("z"))
+		low := reqP("low", 30)
+		s.OnRequest(low)
+		assertAdmitted(t, low)
+		clock.advance(5*time.Second - time.Nanosecond)
+		high := reqP("high", 100)
+		s.OnRequest(high)
+		assertAdmitted(t, high)
+		s.drainQueue()
+		assertQueueOrder(t, s, []string{"high", "low"})
+	})
+
+	t.Run("exactly at threshold", func(t *testing.T) {
+		// age(low) == 5s: >= semantics promote, low outranks the young high.
+		eff := newFakeEffects()
+		for _, m := range []string{"z", "low", "high"} {
+			eff.states[m] = process.StateStopped
+		}
+		planner := &stubPlanner{evict: map[string][]string{"z": {"low", "high"}}}
+		s, clock := newFIFOAging(planner, config.FifoConfig{PromoteAfter: promoteAfterPtr(5)}, nil, eff)
+		s.OnRequest(req("z"))
+		low := reqP("low", 30)
+		s.OnRequest(low)
+		assertAdmitted(t, low)
+		clock.advance(5 * time.Second)
+		high := reqP("high", 100)
+		s.OnRequest(high)
+		assertAdmitted(t, high)
+		s.drainQueue()
+		assertQueueOrder(t, s, []string{"low", "high"})
+	})
 }

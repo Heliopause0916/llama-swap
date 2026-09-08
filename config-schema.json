@@ -874,6 +874,11 @@
                                             "type": "integer",
                                             "description": "How long (seconds) an over-limit request may wait in the queue before being rejected with 429 + Retry-After. Default 60; 0 waits indefinitely.",
                                             "default": 60
+                                        },
+                                        "promoteAfter": {
+                                            "type": "integer",
+                                            "description": "L1.5 request-priority aging: how long (seconds) an over-limit request may wait in the queue before it is pinned, at the next drain, to the scheduler-internal top tier so it is serviced ahead of every newer arrival (a bounded-wait guarantee against starvation). nil or 0 disables the feature (L1 behavior unchanged); a negative value is rejected at load; when enabled the value must be smaller than the effective queueTimeout and every requestPriority band value / defaultPriority must stay below 2147483647 (see docs/design/request-priority.md §17).",
+                                            "default": 0
                                         }
                                     },
                                     "additionalProperties": false

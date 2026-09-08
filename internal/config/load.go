@@ -310,6 +310,47 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		fifo.RequestPriority = normalized
 	}
 
+	// L1.5: request-priority aging (docs/design/request-priority.md §17.3).
+	// promoteAfter is a three-state *int in the queueDepth/queueTimeout
+	// vocabulary: nil or 0 disables the feature (L1 behavior unchanged), a
+	// negative value is a load error, and a positive value enables threshold
+	// promotion. When enabled the effective queueTimeout (the explicit value,
+	// or the 60s default when queueTimeout is unset) must be strictly greater
+	// than promoteAfter — both clocks start at enqueue, so a timeout no larger
+	// than promoteAfter would let the lazy prune drop every item before
+	// promotion could ever fire (D20). Band exclusivity (D17): while the
+	// feature is enabled every declared band value and defaultPriority must be
+	// smaller than the promoted sentinel P_max = 2147483647, so "P_max is not a
+	// band" is locally checkable by inspection. With the feature off the L1
+	// lenient band range applies unchanged.
+	promoteEnabled := false
+	if fifo.PromoteAfter != nil {
+		if *fifo.PromoteAfter < 0 {
+			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.promoteAfter: value %d must not be negative (nil or 0 disables request aging)", *fifo.PromoteAfter)
+		}
+		if *fifo.PromoteAfter > 0 {
+			promoteEnabled = true
+			effTimeout := 60 // the L1 nil default of queueTimeout (seconds)
+			if fifo.QueueTimeout != nil {
+				effTimeout = *fifo.QueueTimeout
+			}
+			if effTimeout > 0 && effTimeout <= *fifo.PromoteAfter {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.promoteAfter: %d must be smaller than the effective queueTimeout (%d); otherwise the timeout prune would drop every request before aging could promote it", *fifo.PromoteAfter, effTimeout)
+			}
+		}
+	}
+	if promoteEnabled {
+		const maxBand = 2147483647 // math.MaxInt32, reserved for the aging promotion tier (D17)
+		for band, value := range fifo.RequestPriority {
+			if value >= maxBand {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority.%s: value %d must be < 2147483647 while promoteAfter is enabled (2147483647 is reserved for the aging promotion tier)", band, value)
+			}
+		}
+		if fifo.DefaultPriority >= maxBand {
+			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.defaultPriority: %d must be < 2147483647 while promoteAfter is enabled (2147483647 is reserved for the aging promotion tier)", fifo.DefaultPriority)
+		}
+	}
+
 	// Clean up hooks preload
 	if len(config.Hooks.OnStartup.Preload) > 0 {
 		var toPreload []string

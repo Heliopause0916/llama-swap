@@ -1970,3 +1970,94 @@ func captureSlog(t *testing.T) (*slog.Logger, *bytes.Buffer) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
 	return orig, &buf
 }
+
+// TestConfig_PromoteAfter_Validation covers the L1.5 §17.3 load-time checks of
+// routing.scheduler.settings.fifo.promoteAfter (docs/design/request-priority.md
+// §17.9): nil/0 disable the feature, a negative value fails the load, a
+// positive value must be smaller than the *effective* queueTimeout (D20 —
+// explicit or the 60s nil default), and — only while the feature is enabled —
+// every declared band value and defaultPriority must stay below the promoted
+// sentinel P_max = 2147483647 (D17). With promoteAfter off the L1 lenient band
+// range applies unchanged.
+func TestConfig_PromoteAfter_Validation(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantErr     string // substring of the load error; "" = must load
+		wantSeconds int    // expected PromoteAfter when set; -1 = must be nil
+	}{
+		{
+			name:        "negative value rejected",
+			body:        "        promoteAfter: -5\n",
+			wantErr:     "promoteAfter",
+			wantSeconds: -1,
+		},
+		{
+			name:        "nil accepted, feature off",
+			body:        "",
+			wantSeconds: -1,
+		},
+		{
+			name:        "zero accepted, feature off",
+			body:        "        promoteAfter: 0\n",
+			wantSeconds: 0,
+		},
+		{
+			name:        "30 seconds with explicit 60s timeout accepted",
+			body:        "        promoteAfter: 30\n        queueTimeout: 60\n",
+			wantSeconds: 30,
+		},
+		{
+			name:        "300 seconds with explicit 60s timeout rejected",
+			body:        "        promoteAfter: 300\n        queueTimeout: 60\n",
+			wantErr:     "promoteAfter",
+			wantSeconds: -1,
+		},
+		{
+			name:        "300 seconds with omitted timeout (effective 60s default) rejected",
+			body:        "        promoteAfter: 300\n",
+			wantErr:     "queueTimeout",
+			wantSeconds: -1,
+		},
+		{
+			name:        "infinite timeout pairs with any promoteAfter",
+			body:        "        promoteAfter: 300\n        queueTimeout: 0\n",
+			wantSeconds: 300,
+		},
+		{
+			name:        "band value at the promoted sentinel rejected while enabled",
+			body:        "        promoteAfter: 30\n        requestPriority: {high: 2147483648, medium: 60}\n        defaultPriority: 60\n",
+			wantErr:     "2147483647",
+			wantSeconds: -1,
+		},
+		{
+			name:        "empty requestPriority accepted with promoteAfter enabled (D21)",
+			body:        "        promoteAfter: 30\n        requestPriority: {}\n",
+			wantSeconds: 30,
+		},
+		{
+			name:        "band value at the sentinel accepted while feature off (L1 lenient range)",
+			body:        "        requestPriority: {high: 2147483648, medium: 60}\n        defaultPriority: 60\n",
+			wantSeconds: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(fifoYAML(tt.body)))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			fifo := cfg.Routing.Scheduler.Settings.Fifo
+			if tt.wantSeconds == -1 {
+				assert.Nil(t, fifo.PromoteAfter)
+			} else {
+				require.NotNil(t, fifo.PromoteAfter)
+				assert.Equal(t, tt.wantSeconds, *fifo.PromoteAfter)
+			}
+		})
+	}
+}

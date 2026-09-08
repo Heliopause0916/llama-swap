@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -26,6 +27,14 @@ const defaultQueueDepth = 10
 // before it is rejected with 429 + Retry-After (see FifoConfig.QueueTimeout).
 const defaultQueueTimeout = 60 * time.Second
 
+// L1.5: request-priority aging (docs/design/request-priority.md §17.2/D17).
+// promotedPriority is the scheduler-internal top tier a queued request is
+// pinned to once its queue age reaches promoteAfter. It is math.MaxInt32,
+// strictly above every configured band (load validation forbids band values
+// >= it while the feature is enabled), and is never exposed through any
+// existing channel: observers keep seeing the resolved band (D22).
+const promotedPriority = math.MaxInt32
+
 // activeSwap tracks one in-flight swap and the callers waiting on it.
 type activeSwap struct {
 	modelID string
@@ -40,7 +49,14 @@ type activeSwap struct {
 // timer or sweeper is needed.
 type queuedItem struct {
 	Req      HandlerReq
-	Deadline time.Time
+	Deadline time.Time // PATCH(v255): queueTimeout, unchanged
+
+	// L1.5: request-priority aging (docs/design/request-priority.md §17.2/D16).
+	// EnqueuedAt is written exactly once, at enqueue, and never reset when a
+	// drain skips the item — wait time accrues continuously across skips, so
+	// the aging guarantee cannot be "forgiven" by a collision or capacity block
+	// (D19).
+	EnqueuedAt time.Time
 }
 
 // FIFO is the default scheduler. Requests are handled in a first-in, first-out order.
@@ -68,6 +84,10 @@ type FIFO struct {
 	// PATCH(v255): queueing for over-limit requests
 	queueDepth   int           // 0 = disabled (legacy 429 behavior)
 	queueTimeout time.Duration // 0 = wait indefinitely
+
+	// L1.5: request-priority aging (docs/design/request-priority.md §17)
+	promoteAfter time.Duration    // 0 = feature off (L1 drain behavior unchanged); > 0 = pin queue age >= this at the next drain
+	now          func() time.Time // injectable clock (D23); default time.Now, shared by deadline(), the aging check and the timeout prune
 }
 
 // QueuedInfo describes one request currently waiting in the scheduler queue.
@@ -129,6 +149,15 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		qTimeout = time.Duration(*cfg.QueueTimeout) * time.Second
 	}
 
+	// L1.5: request-priority aging (docs/design/request-priority.md §17.3).
+	// nil or 0 keeps the feature off and drainQueue byte-for-byte L1; a
+	// positive value enables threshold promotion (extreme values keep the same
+	// leniency queueTimeout exhibits — no overflow machinery).
+	promoteAfter := time.Duration(0)
+	if cfg.PromoteAfter != nil && *cfg.PromoteAfter > 0 {
+		promoteAfter = time.Duration(*cfg.PromoteAfter) * time.Second
+	}
+
 	return &FIFO{
 		name:     name,
 		logger:   logger,
@@ -142,6 +171,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		// PATCH(v255): queueing for over-limit requests
 		queueDepth:   qDepth,
 		queueTimeout: qTimeout,
+		// L1.5: request-priority aging
+		promoteAfter: promoteAfter,
+		now:          time.Now,
 	}
 }
 
@@ -470,12 +502,13 @@ func (s *FIFO) queueingEnabled() bool { return s.queueDepth > 0 }
 
 // PATCH(v255): queueing for over-limit requests
 // deadline returns the queue deadline for a newly enqueued request, or the zero
-// time when queueTimeout is not configured (wait indefinitely).
+// time when queueTimeout is not configured (wait indefinitely). It reads the
+// injectable clock (D23) — with the default clock this is identical to L1.
 func (s *FIFO) deadline() time.Time {
 	if s.queueTimeout <= 0 {
 		return time.Time{}
 	}
-	return time.Now().Add(s.queueTimeout)
+	return s.now().Add(s.queueTimeout)
 }
 
 // PATCH(v255): queueing for over-limit requests
@@ -521,17 +554,68 @@ func (s *FIFO) enqueue(req HandlerReq, deadline time.Time) {
 	}
 	s.queued = append(s.queued, queuedItem{})
 	copy(s.queued[i+1:], s.queued[i:])
-	s.queued[i] = queuedItem{Req: req, Deadline: deadline} // zero Deadline => never expires
+	// L1.5: request-priority aging. EnqueuedAt is stamped exactly once, here;
+	// drain skips re-append the queuedItem wholesale, so the stamp doubles as
+	// the aging clock and is never reset (D16/D19). A fresh item cannot be
+	// pinned (age < promoteAfter), so the resolved-band insert is exactly right.
+	s.queued[i] = queuedItem{Req: req, Deadline: deadline, EnqueuedAt: s.now()} // zero Deadline => never expires
 	broadcastQueuePositions(s.queued)
+}
+
+// L1.5: request-priority aging (docs/design/request-priority.md §17.2).
+// effective returns the item's scheduling sort key: the resolved band normally,
+// or promotedPriority once the item has waited in the queue for at least
+// promoteAfter (>= semantics, boundary-tested). Scheduler-internal only — the
+// value is never observable through any existing channel (D22).
+func (s *FIFO) effective(item queuedItem) int {
+	if s.promoteAfter > 0 && s.now().Sub(item.EnqueuedAt) >= s.promoteAfter {
+		return promotedPriority
+	}
+	return item.Req.Priority
 }
 
 // drainQueue walks the queued requests in order, re-running the OnRequest
 // decision tree against the (now smaller) active set. Items that can now start
-// or join become satisfied; items still blocked remain queued in original order
+// or join become satisfied; items still blocked remain queued in effective
+// order (L1: original arrival/priority order; L1.5: the aging re-rank order)
 // so they get another chance on the next swap completion.
 func (s *FIFO) drainQueue() {
 	if len(s.queued) == 0 {
 		return
+	}
+	// L1.5: request-priority aging (docs/design/request-priority.md §17.4).
+	// Re-rank by the dual key (effective priority desc, EnqueuedAt asc): items
+	// whose queue age reached promoteAfter are pinned to promotedPriority
+	// (§17.7 lock-in) ahead of every newer arrival whatever its resolved band,
+	// and within every tier — including the pinned P_max tier — the order is
+	// the explicit arrival order. That closes the lock-in lemma for a later,
+	// higher-band arrival that itself ages to pinned: it can never overtake an
+	// earlier-arrived item whatever enqueue's band insert did (EnqueuedAt ties
+	// fall back to the stable sort's preserved relative order). With the
+	// feature off (promoteAfter <= 0) this branch is never taken and the
+	// single-pass walk below is byte-for-byte L1. Each item's effective value
+	// is paired with the item itself before sorting, so the comparator reads
+	// stable per-item keys (never re-reading the clock) and remains
+	// index-coherent as the sort permutes the slice (§17.11).
+	if s.promoteAfter > 0 {
+		type effItem struct {
+			item queuedItem
+			eff  int
+		}
+		es := make([]effItem, len(s.queued))
+		for i, item := range s.queued {
+			es[i].item = item
+			es[i].eff = s.effective(item)
+		}
+		sort.SliceStable(es, func(i, j int) bool {
+			if es[i].eff != es[j].eff {
+				return es[i].eff > es[j].eff
+			}
+			return es[i].item.EnqueuedAt.Before(es[j].item.EnqueuedAt)
+		})
+		for i := range s.queued {
+			s.queued[i] = es[i].item
+		}
 	}
 	pending := s.queued
 	var remaining []queuedItem
@@ -540,8 +624,10 @@ func (s *FIFO) drainQueue() {
 
 		// PATCH(v255): queueing for over-limit requests
 		// Lazy timeout: prune expired waiters first so their reservations are
-		// released and become visible to later items in this same drain.
-		if !item.Deadline.IsZero() && time.Now().After(item.Deadline) {
+		// released and become visible to later items in this same drain. The
+		// check reads the injectable clock (D23) for deterministic tests; the
+		// lazy prune still wins over aging (TestFIFO_Aging_TimeoutPruneStillWins).
+		if !item.Deadline.IsZero() && s.now().After(item.Deadline) {
 			s.logger.Debugf("%s: over-limit queued request for model %s timed out", s.name, req.Model)
 			s.grantError(req, swaputil.ConcurrencyLimitError{RetryAfter: 1})
 			continue // grantError releases the reservation

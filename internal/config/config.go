@@ -268,6 +268,16 @@ type FifoConfig struct {
 	// the queue before it is rejected with 429 + Retry-After. nil means the
 	// default of 60; 0 disables the timeout and waits indefinitely.
 	QueueTimeout *int `yaml:"queueTimeout"`
+
+	// L1.5: request-priority aging (docs/design/request-priority.md §17).
+	// PromoteAfter is how long (in seconds) an over-limit request may wait in
+	// the queue before it is pinned, at the next drain, to the
+	// scheduler-internal top tier (P_max = 2147483647) so it is serviced ahead
+	// of every newer arrival — a bounded-wait guarantee against starvation.
+	// nil or 0 disables the feature and leaves L1 drain behavior byte-for-byte
+	// unchanged. When enabled, the value must be smaller than the effective
+	// queueTimeout (D20), and every declared band value must stay below P_max.
+	PromoteAfter *int `yaml:"promoteAfter"`
 }
 
 type RouterConfig struct {
