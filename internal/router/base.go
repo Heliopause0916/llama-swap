@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -679,37 +678,13 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	resp.HandleFunc(w, req)
 }
 
-// resolvePriority maps the X-Request-Priority header to a band value
-// (docs/design/request-priority.md §7). Branch labels match the fallback
-// chain:
-//
-//	C  — header absent: silently returns defaultPriority (normal steady state,
-//	     no log)
-//	B' — header present but blank/whitespace: warns (deduped by raw), default
-//	A  — trimmed, case-insensitive value matches a declared band: returns it
-//	B  — unknown word: warns (deduped by raw; message includes raw + target)
-//
-// When requestPriority is empty the feature is OFF (§6): the header is never
-// read and every request silently resolves to defaultPriority. warnOnce is
-// invoked on branches B/B'; the caller owns the raw-keyed dedup.
+// resolvePriority is the baseRouter adapter for ResolveRequestPriority: it
+// reads the configured header off the request and wires in the router's
+// deduped warning callback. See ResolveRequestPriority for the §7 fallback
+// chain (docs/design/request-priority.md); the caller (ServeHTTP) owns the
+// single 0→defaultPriority normalization point (D12).
 func resolvePriority(r *http.Request, cfg config.FifoConfig, warnOnce func(raw string, target int)) int {
-	if len(cfg.RequestPriority) == 0 { // feature off — header never read (§6/D5)
-		return cfg.DefaultPriority
-	}
-	vals := r.Header.Values(cfg.PriorityHeader)
-	if len(vals) == 0 { // branch C: header absent
-		return cfg.DefaultPriority // silent, normal steady state, no log
-	}
-	raw := strings.TrimSpace(vals[0]) // multiple same-name headers: first wins (D13)
-	if raw == "" {                    // branch B': present but blank/whitespace
-		warnOnce(raw, cfg.DefaultPriority) // warning, deduped by raw
-		return cfg.DefaultPriority
-	}
-	if p, ok := cfg.RequestPriority[strings.ToLower(raw)]; ok { // branch A
-		return p
-	}
-	warnOnce(raw, cfg.DefaultPriority) // branch B: unknown word
-	return cfg.DefaultPriority
+	return ResolveRequestPriority(r.Header.Values(cfg.PriorityHeader), cfg.RequestPriority, cfg.DefaultPriority, warnOnce)
 }
 
 // warnPriorityMiss is the warnOnce implementation passed to resolvePriority.

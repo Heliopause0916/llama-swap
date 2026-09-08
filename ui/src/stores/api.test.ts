@@ -98,7 +98,7 @@ describe("api store event handling", () => {
               resp_headers: {},
               resp_bytes: 0,
               elapsed_ms: 125,
-              metadata: { source: "test" },
+              metadata: { source: "test", priority: "100" },
             },
           ],
         }),
@@ -119,7 +119,7 @@ describe("api store event handling", () => {
         resp_bytes: 0,
         elapsed_ms: 125,
         client_received_at_ms: expect.any(Number),
-        metadata: { source: "test" },
+        metadata: { source: "test", priority: "100" },
       },
     ]);
   });

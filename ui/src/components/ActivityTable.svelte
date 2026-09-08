@@ -191,6 +191,7 @@
       { id: "cancel", label: "Cancel", defaultVisible: true },
       { id: "elapsed", label: "Elapsed", defaultVisible: true },
       { id: "stage", label: "Stage", defaultVisible: true },
+      { id: "priority", label: "Priority", defaultVisible: true },
     ];
     if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
     cols.push(
@@ -763,6 +764,12 @@
                       <span class="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium whitespace-nowrap text-emerald-600 dark:text-emerald-400">
                         Serving
                       </span>
+                    {/if}
+                  {:else if columnId === "priority"}
+                    {#if request.metadata?.priority}
+                      <span class="font-mono text-xs tabular-nums">{request.metadata.priority}</span>
+                    {:else}
+                      <span class="text-muted-foreground">—</span>
                     {/if}
                   {:else if columnId === "model"}
                     <MiddleEllipsis value={request.model} tailLength={10} className="max-w-[14rem]" />

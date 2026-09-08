@@ -513,6 +513,29 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			defer cancel()
 
 			r = r.WithContext(ctx)
+
+			// Capsule the resolved request priority band into the request
+			// metadata BEFORE the tracker snapshots it (Add shallow-copies
+			// Metadata, so writes after Add would never reach the in-flight
+			// list). Display-only: the metadata "priority" key feeds the UI's
+			// Priority column and changes no scheduling semantics. Nothing is
+			// written when the feature is off (empty RequestPriority), which
+			// makes the column render "—" (see docs/design/request-priority.md
+			// §16). The nil warnOnce keeps the authoritative router the only
+			// logger for B/B' branch misses (dedup stays single-sourced).
+			if prioCfg := cfg.Routing.Scheduler.Settings.Fifo; len(prioCfg.RequestPriority) > 0 {
+				p := router.ResolveRequestPriority(
+					r.Header.Values(prioCfg.PriorityHeader),
+					prioCfg.RequestPriority,
+					prioCfg.DefaultPriority,
+					nil,
+				)
+				if p == 0 { // mirror the router's single normalization point
+					p = prioCfg.DefaultPriority
+				}
+				_ = swaputil.SetReqData(ctx, "priority", strconv.Itoa(p))
+			}
+
 			id := t.Add(r, cancel)
 			defer t.Remove(id)
 

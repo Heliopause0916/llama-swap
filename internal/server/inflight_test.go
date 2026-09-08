@@ -234,6 +234,179 @@ func TestServer_InflightStageUpdaterReclaimsIdleSlot(t *testing.T) {
 	tracker.mu.Unlock()
 }
 
+// TestServer_InflightPriorityMetadata_HeaderBand verifies that with request
+// priority enabled, CreateInflightMiddleware resolves the X-Request-Priority
+// band header and writes it into the request metadata BEFORE Add snapshots it,
+// so the tracked entry's Metadata carries "priority" = band value. The write is
+// display-only: it feeds the UI Priority column and never affects scheduling.
+func TestServer_InflightPriorityMetadata_HeaderBand(t *testing.T) {
+	cfg := config.Config{
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{
+						PriorityHeader:  "X-Request-Priority",
+						RequestPriority: map[string]int{"high": 100},
+						DefaultPriority: 60,
+					},
+				},
+			},
+		},
+	}
+	tracker := newInflightTrackerWithPublisher(16, func(swaputil.InFlightRequestsEvent) {})
+	var captured *swaputil.InflightRequestEntry
+	mw := CreateInflightMiddleware(tracker, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID, _ := swaputil.InflightID(r.Context())
+		tracker.mu.RLock()
+		if req, ok := tracker.requests[gotID]; ok {
+			entry := req.entry
+			captured = &entry
+		}
+		tracker.mu.RUnlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Request-Priority", "high")
+	// The real chain seeds ReqContextData (with a metadata map) before the
+	// inflight middleware; mirror that so SetReqData has a map to write into.
+	req = req.WithContext(swaputil.SetContext(req.Context(),
+		swaputil.ReqContextData{Model: "m1", ModelID: "m1", Metadata: make(map[string]string)}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured == nil {
+		t.Fatal("tracked request not found in tracker")
+	}
+	if got := captured.Metadata["priority"]; got != "100" {
+		t.Fatalf("metadata.priority=%q want \"100\"", got)
+	}
+}
+
+// TestServer_InflightPriorityMetadata_FeatureOff verifies that when request
+// priority is disabled (empty RequestPriority map) the inflight middleware
+// writes no "priority" metadata key, so the UI Priority column renders "—"
+// for every row (feature off is indistinguishable from "unset").
+func TestServer_InflightPriorityMetadata_FeatureOff(t *testing.T) {
+	tracker := newInflightTrackerWithPublisher(16, func(swaputil.InFlightRequestsEvent) {})
+	var captured *swaputil.InflightRequestEntry
+	mw := CreateInflightMiddleware(tracker, config.Config{}) // RequestPriority nil
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID, _ := swaputil.InflightID(r.Context())
+		tracker.mu.RLock()
+		if req, ok := tracker.requests[gotID]; ok {
+			entry := req.entry
+			captured = &entry
+		}
+		tracker.mu.RUnlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Request-Priority", "high")
+	req = req.WithContext(swaputil.SetContext(req.Context(),
+		swaputil.ReqContextData{Model: "m1", ModelID: "m1", Metadata: make(map[string]string)}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured == nil {
+		t.Fatal("tracked request not found in tracker")
+	}
+	if _, ok := captured.Metadata["priority"]; ok {
+		t.Fatalf("metadata.priority present for feature-off config: %v", captured.Metadata)
+	}
+}
+
+// TestServer_InflightPriorityMetadata_HeaderMissingDefaultsToDefault verifies
+// the display path's branch C: with request priority enabled but no
+// X-Request-Priority header, the middleware resolves the default band and
+// stamps it into the tracked entry's Metadata as strconv of DefaultPriority.
+func TestServer_InflightPriorityMetadata_HeaderMissingDefaultsToDefault(t *testing.T) {
+	cfg := config.Config{
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{
+						PriorityHeader:  "X-Request-Priority",
+						RequestPriority: map[string]int{"high": 100},
+						DefaultPriority: 60,
+					},
+				},
+			},
+		},
+	}
+	tracker := newInflightTrackerWithPublisher(16, func(swaputil.InFlightRequestsEvent) {})
+	var captured *swaputil.InflightRequestEntry
+	mw := CreateInflightMiddleware(tracker, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID, _ := swaputil.InflightID(r.Context())
+		tracker.mu.RLock()
+		if req, ok := tracker.requests[gotID]; ok {
+			entry := req.entry
+			captured = &entry
+		}
+		tracker.mu.RUnlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil) // no priority header
+	req = req.WithContext(swaputil.SetContext(req.Context(),
+		swaputil.ReqContextData{Model: "m1", ModelID: "m1", Metadata: make(map[string]string)}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured == nil {
+		t.Fatal("tracked request not found in tracker")
+	}
+	if got := captured.Metadata["priority"]; got != "60" {
+		t.Fatalf("metadata.priority=%q want \"60\" (default band)", got)
+	}
+}
+
+// TestServer_InflightPriorityMetadata_BlankHeaderFallsBackToDefault verifies
+// the display path's branch B': a blank/whitespace X-Request-Priority header
+// resolves to the default band (returned silently by the display path, which
+// passes a nil warnOnce) and is stamped into the tracked entry's Metadata.
+func TestServer_InflightPriorityMetadata_BlankHeaderFallsBackToDefault(t *testing.T) {
+	cfg := config.Config{
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{
+						PriorityHeader:  "X-Request-Priority",
+						RequestPriority: map[string]int{"high": 100},
+						DefaultPriority: 60,
+					},
+				},
+			},
+		},
+	}
+	tracker := newInflightTrackerWithPublisher(16, func(swaputil.InFlightRequestsEvent) {})
+	var captured *swaputil.InflightRequestEntry
+	mw := CreateInflightMiddleware(tracker, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID, _ := swaputil.InflightID(r.Context())
+		tracker.mu.RLock()
+		if req, ok := tracker.requests[gotID]; ok {
+			entry := req.entry
+			captured = &entry
+		}
+		tracker.mu.RUnlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Request-Priority", "   ") // branch B′: whitespace only
+	req = req.WithContext(swaputil.SetContext(req.Context(),
+		swaputil.ReqContextData{Model: "m1", ModelID: "m1", Metadata: make(map[string]string)}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured == nil {
+		t.Fatal("tracked request not found in tracker")
+	}
+	if got := captured.Metadata["priority"]; got != "60" {
+		t.Fatalf("metadata.priority=%q want \"60\" (default band after B′)", got)
+	}
+}
+
 // waitForStageEvents blocks until at least n stage events have been published
 // (the publish callback runs on the tracker's async publisher goroutine).
 func waitForStageEvents(t *testing.T, mu *sync.Mutex, stages *[]string, n int) {
