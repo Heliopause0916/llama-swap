@@ -69,6 +69,12 @@ type InflightRequestEntry struct {
 	RespBytes   int64             `json:"resp_bytes"`
 	ElapsedMs   int64             `json:"elapsed_ms"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	// Stage marks whether the request is queued in the scheduler ("queued")
+	// or actively being served ("serving"). Zero value means served.
+	Stage string `json:"stage,omitempty"`
+	// QueuePosition is the request's 1-indexed position in the scheduler
+	// queue; meaningful only while Stage is "queued".
+	QueuePosition int `json:"queue_position,omitempty"`
 }
 
 type ProfileChangedEvent struct {

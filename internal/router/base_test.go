@@ -39,6 +39,33 @@ func (s *stubPlanner) EvictionFor(target string, _ []string) []string {
 }
 func (s *stubPlanner) OnSwapStart(string, []string) {}
 
+// stubQueueScheduler implements scheduler.Scheduler plus the
+// queueSnapshotProvider interface, reporting a fixed queue snapshot. It lets
+// QueueSnapshot's run-loop round-trip be tested without orchestrating a real
+// FIFO queue.
+type stubQueueScheduler struct {
+	queued []scheduler.QueuedInfo
+}
+
+func (s *stubQueueScheduler) OnRequest(scheduler.HandlerReq)       {}
+func (s *stubQueueScheduler) OnCancel(scheduler.HandlerReq)        {}
+func (s *stubQueueScheduler) OnSwapDone(scheduler.SwapDone)        {}
+func (s *stubQueueScheduler) OnServeDone(scheduler.ServeDoneEvent) {}
+func (s *stubQueueScheduler) OnUnload([]string, time.Duration)     {}
+func (s *stubQueueScheduler) OnShutdown(error)                     {}
+func (s *stubQueueScheduler) Queued() []scheduler.QueuedInfo       { return s.queued }
+
+// stubNoQueueScheduler implements scheduler.Scheduler without the
+// queueSnapshotProvider interface: baseRouter.QueueSnapshot must return nil.
+type stubNoQueueScheduler struct{}
+
+func (s *stubNoQueueScheduler) OnRequest(scheduler.HandlerReq)       {}
+func (s *stubNoQueueScheduler) OnCancel(scheduler.HandlerReq)        {}
+func (s *stubNoQueueScheduler) OnSwapDone(scheduler.SwapDone)        {}
+func (s *stubNoQueueScheduler) OnServeDone(scheduler.ServeDoneEvent) {}
+func (s *stubNoQueueScheduler) OnUnload([]string, time.Duration)     {}
+func (s *stubNoQueueScheduler) OnShutdown(error)                     {}
+
 func newTestBase(t *testing.T, processes map[string]process.Process, planner scheduler.Swapper) *baseRouter {
 	t.Helper()
 	conf := config.Config{HealthCheckTimeout: 5}
@@ -84,6 +111,44 @@ func TestBaseRouter_RunningModels(t *testing.T) {
 	}
 	if _, ok := running["stopped"]; ok {
 		t.Errorf("stopped process should be excluded from RunningModels")
+	}
+}
+
+// TestBaseRouter_QueueSnapshot verifies the run-loop round-trip that reads the
+// scheduler queue: entries arrive in scheduler order, a scheduler without the
+// snapshot provider yields nil, and an empty queue yields nil.
+func TestBaseRouter_QueueSnapshot(t *testing.T) {
+	b := newTestBase(t, nil, &stubPlanner{})
+
+	b.schedule = &stubQueueScheduler{queued: []scheduler.QueuedInfo{
+		{RequestID: "r1", Model: "a", QueuePosition: 1},
+		{RequestID: "r2", Model: "b", QueuePosition: 2},
+	}}
+
+	got := b.QueueSnapshot()
+	want := []QueueInfo{
+		{RequestID: "r1", Model: "a", QueuePosition: 1},
+		{RequestID: "r2", Model: "b", QueuePosition: 2},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("QueueSnapshot()=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("QueueSnapshot()=%v want %v", got, want)
+		}
+	}
+
+	// A scheduler that does not expose its queue yields nil.
+	b.schedule = &stubNoQueueScheduler{}
+	if got := b.QueueSnapshot(); got != nil {
+		t.Fatalf("QueueSnapshot()=%v want nil for scheduler without provider", got)
+	}
+
+	// An empty queue yields nil.
+	b.schedule = &stubQueueScheduler{}
+	if got := b.QueueSnapshot(); got != nil {
+		t.Fatalf("QueueSnapshot()=%v want nil for empty queue", got)
 	}
 }
 

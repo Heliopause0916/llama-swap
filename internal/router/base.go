@@ -27,6 +27,10 @@ type unloadReq struct {
 	respond chan struct{}
 }
 
+type queueSnapReq struct {
+	respond chan []QueueInfo
+}
+
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
 // scheduler.Swapper describing how eviction sets are decided. baseRouter
@@ -57,6 +61,7 @@ type baseRouter struct {
 	cancelCh    chan scheduler.HandlerReq
 	shutdownCh  chan shutdownReq
 	unloadCh    chan unloadReq
+	queueSnapCh chan queueSnapReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
 
@@ -92,6 +97,7 @@ func newBaseRouter(
 		cancelCh:    make(chan scheduler.HandlerReq),
 		shutdownCh:  make(chan shutdownReq),
 		unloadCh:    make(chan unloadReq),
+		queueSnapCh: make(chan queueSnapReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
@@ -132,6 +138,9 @@ func (b *baseRouter) run() {
 			close(req.respond)
 			b.notifyProcessed()
 
+		case req := <-b.queueSnapCh:
+			b.handleQueueSnapshot(req)
+
 		case ev := <-b.swapDoneCh:
 			b.schedule.OnSwapDone(ev)
 			b.notifyProcessed()
@@ -139,6 +148,50 @@ func (b *baseRouter) run() {
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
 		}
+	}
+}
+
+// handleQueueSnapshot answers a QueueSnapshot request on the run loop by
+// asking the scheduler for its queue, when the scheduler exposes one.
+func (b *baseRouter) handleQueueSnapshot(req queueSnapReq) {
+	snapshot, ok := b.schedule.(queueSnapshotProvider)
+	if !ok {
+		req.respond <- nil
+		return
+	}
+	queued := snapshot.Queued()
+	if len(queued) == 0 {
+		req.respond <- nil
+		return
+	}
+	out := make([]QueueInfo, 0, len(queued))
+	for _, q := range queued {
+		out = append(out, QueueInfo{
+			RequestID:     q.RequestID,
+			Model:         q.Model,
+			QueuePosition: q.QueuePosition,
+		})
+	}
+	req.respond <- out
+}
+
+// QueueSnapshot returns the scheduler queue's current contents: one entry per
+// queued request, in service order with 1-indexed positions, or nil when the
+// scheduler does not expose its queue. The read funnels through the run loop
+// (see sendUnload) so it observes scheduler state atomically with scheduling
+// events.
+func (b *baseRouter) QueueSnapshot() []QueueInfo {
+	req := queueSnapReq{respond: make(chan []QueueInfo, 1)}
+	select {
+	case b.queueSnapCh <- req:
+	case <-b.runDone:
+		return nil
+	}
+	select {
+	case out := <-req.respond:
+		return out
+	case <-b.runDone:
+		return nil
 	}
 }
 

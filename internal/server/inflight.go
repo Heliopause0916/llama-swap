@@ -16,11 +16,18 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 const inflightUpdateInterval = 250 * time.Millisecond
 const inflightOutboxSize = 128
+
+// stageUpdateInterval is how often the stage updater polls the scheduler queue
+// snapshot. It is deliberately larger than inflightUpdateInterval so the
+// 250ms SSE throttle absorbs most queue -> serving transitions without an
+// extra flush.
+const stageUpdateInterval = 500 * time.Millisecond
 
 const (
 	inflightOperationSnapshot = "snapshot"
@@ -58,6 +65,14 @@ type inflightTracker struct {
 	needsSnapshot    atomic.Bool
 	publisherRunning atomic.Bool
 	publish          func(swaputil.InFlightRequestsEvent)
+
+	// queueSnapshot, when non-nil, returns the router scheduler queue's
+	// current contents. The stage updater polls it to decide each tracked
+	// request's "queued" / "serving" stage. Requests routed to a scheduler
+	// without a queue (or peer-direct requests) never appear in it and keep
+	// stage "serving".
+	queueSnapshot       func() []router.QueueInfo
+	stageUpdaterRunning atomic.Bool
 }
 
 type inflightRequest struct {
@@ -71,6 +86,16 @@ func newInflightTracker() *inflightTracker {
 	return newInflightTrackerWithPublisher(inflightOutboxSize, func(update swaputil.InFlightRequestsEvent) {
 		event.Emit(update)
 	})
+}
+
+// newInflightTrackerWithQueueSnapshot wires the scheduler queue poller that
+// marks tracked requests as queued or serving.
+func newInflightTrackerWithQueueSnapshot(snapshot func() []router.QueueInfo) *inflightTracker {
+	t := newInflightTrackerWithPublisher(inflightOutboxSize, func(update swaputil.InFlightRequestsEvent) {
+		event.Emit(update)
+	})
+	t.queueSnapshot = snapshot
+	return t
 }
 
 func newInflightTrackerWithPublisher(size int, publish func(swaputil.InFlightRequestsEvent)) *inflightTracker {
@@ -92,6 +117,9 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 		ReqHeaders:  headerMap(r.Header),
 		RemoteIP:    clientIP(r),
 		RespHeaders: map[string]string{},
+		// Every tracked request starts out serving; the stage updater flips
+		// it to "queued" once the scheduler reports it in the queue.
+		Stage: "serving",
 	}
 	redactHeaders(entry.ReqHeaders)
 	if data, ok := swaputil.ReadContext(r.Context()); ok {
@@ -104,6 +132,7 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 	t.requests[id] = req
 	t.enqueueLocked(upsertInflightEvent(req.entry))
 	t.mu.Unlock()
+	t.startStageUpdater()
 	return id
 }
 
@@ -118,6 +147,104 @@ func (t *inflightTracker) Remove(id string) {
 		t.enqueueLocked(swaputil.InFlightRequestsEvent{Operation: inflightOperationRemove, ID: id})
 	}
 	t.mu.Unlock()
+}
+
+// startStageUpdater launches the periodic stage-polling goroutine. Like
+// startPublisher it uses an idle-exit lifecycle: it starts when the first
+// request is tracked (and only when a queue snapshot source is wired —
+// otherwise there is nothing to poll) and the goroutine exits once requests
+// disappear, so a tracker that is never used does not tick forever.
+func (t *inflightTracker) startStageUpdater() {
+	if t.queueSnapshot == nil {
+		return
+	}
+	if t.stageUpdaterRunning.CompareAndSwap(false, true) {
+		go t.runStageUpdater()
+	}
+}
+
+func (t *inflightTracker) runStageUpdater() {
+	// reclaimStageUpdater runs on exit (idle or error) and re-claims the
+	// running slot when a request raced the transition to idle.
+	defer t.reclaimStageUpdater()
+	ticker := time.NewTicker(stageUpdateInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		// updateStages returns false to signal "nothing left to poll".
+		if !t.updateStages() {
+			return
+		}
+	}
+}
+
+// reclaimStageUpdater is the stage updater's idle-exit defense. It mirrors the
+// pattern publishUpdates uses for the equivalent race: Store(false) releases
+// the "running" flag first, so an Add on the other side of the exit window can
+// win the startStageUpdater CAS and launch its own poller; the re-check below
+// then notices a request that landed during the window, re-claims the slot via
+// CAS, and restarts the poller. Without this, such a request would keep the
+// "serving" stage forever even while it sits in the queue.
+func (t *inflightTracker) reclaimStageUpdater() {
+	t.stageUpdaterRunning.Store(false)
+	// Do not restart without a snapshot source: startStageUpdater refuses to
+	// launch in that case, so a detached poller could only churn one tick.
+	if t.queueSnapshot == nil {
+		return
+	}
+	t.mu.Lock()
+	more := len(t.requests) > 0
+	t.mu.Unlock()
+	if more && t.stageUpdaterRunning.CompareAndSwap(false, true) {
+		go t.runStageUpdater()
+	}
+}
+
+// updateStages polls the scheduler queue snapshot and flips every tracked
+// request whose stage or queue position changed, pushing one upsert event per
+// change through the existing outbox (250ms SSE throttle applies as usual).
+//
+// Stage semantics are approximate (v1): only requests present in the queue
+// snapshot are marked "queued"; fast-path admitted requests and requests
+// joined to an in-progress swap (join waiters) are not queued and keep the
+// default "serving" stage.
+//
+// It returns false when there is no snapshot source or no tracked request,
+// which tells runStageUpdater to exit. Called directly in tests; lock-free
+// aside from the requests map mutex, which it takes itself.
+func (t *inflightTracker) updateStages() bool {
+	snapshot := t.queueSnapshot
+	if snapshot == nil {
+		return false
+	}
+
+	// Build the position map outside the lock: QueueSnapshot round-trips
+	// through the router's run-loop goroutine and may block on scheduler
+	// work.
+	positions := make(map[string]int)
+	for _, q := range snapshot() {
+		if q.RequestID != "" {
+			positions[q.RequestID] = q.QueuePosition
+		}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.requests) == 0 {
+		return false
+	}
+
+	for id, req := range t.requests {
+		stage, pos := "serving", 0
+		if qp, ok := positions[id]; ok {
+			stage, pos = "queued", qp
+		}
+		if req.entry.Stage != stage || req.entry.QueuePosition != pos {
+			req.entry.Stage = stage
+			req.entry.QueuePosition = pos
+			t.enqueueLocked(upsertInflightEvent(req.entry))
+		}
+	}
+	return true
 }
 
 func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
@@ -388,6 +515,12 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			r = r.WithContext(ctx)
 			id := t.Add(r, cancel)
 			defer t.Remove(id)
+
+			// Carry the tracker's request ID in the context so the router's
+			// scheduler queue snapshot can match this request back to its
+			// tracked entry. Deliberately outside ReqContextData.Metadata,
+			// which is user-facing and lands in activity logs.
+			r = r.WithContext(swaputil.WithInflightID(r.Context(), id))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})

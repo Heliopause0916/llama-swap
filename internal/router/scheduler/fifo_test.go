@@ -184,6 +184,15 @@ func reqCh(model string) HandlerReq {
 	return r
 }
 
+// reqWithID creates a request whose context carries the given inflight ID via
+// swaputil.WithInflightID, matching how CreateInflightMiddleware stamps the
+// context before a request reaches the scheduler.
+func reqWithID(model, id string) HandlerReq {
+	r := req(model)
+	r.Ctx = swaputil.WithInflightID(context.Background(), id)
+	return r
+}
+
 // reqPos creates a HandlerReq that also listens for queue-position broadcasts.
 func reqPos(model string) HandlerReq {
 	r := reqCh(model)
@@ -703,6 +712,59 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("queue=%v want %v", got, want)
 		}
+	}
+}
+
+// TestFIFO_Queued mirrors TestFIFO_PriorityQueueOrder's queue construction and
+// verifies the read-only snapshot: service order, 1-indexed positions, and the
+// inflight ID read back from each request's context metadata.
+func TestFIFO_Queued(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "A", "B", "C", "D"} {
+		eff.states[m] = process.StateStopped
+	}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
+	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
+
+	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D]) — the rest queue
+
+	// Arrive out of priority order, each carrying a unique inflight ID.
+	ids := map[string]string{"B": "b-1", "D": "d-2", "C": "c-3", "A": "a-4"}
+	for _, m := range []string{"B", "D", "C", "A"} {
+		s.OnRequest(reqWithID(m, ids[m]))
+	}
+
+	// Queue order is priority desc (A,B,C,D); positions are 1-indexed.
+	got := s.Queued()
+	want := []QueuedInfo{
+		{RequestID: "a-4", Model: "A", QueuePosition: 1},
+		{RequestID: "b-1", Model: "B", QueuePosition: 2},
+		{RequestID: "c-3", Model: "C", QueuePosition: 3},
+		{RequestID: "d-2", Model: "D", QueuePosition: 4},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Queued()=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Queued()=%v want %v", got, want)
+		}
+	}
+
+	// Requests without an inflight ID in their context yield an empty ID
+	// rather than failing the snapshot: a D (priority 1) slots in behind
+	// the existing D at the tail.
+	s.OnRequest(req("D")) // second D queues at the tail without an ID
+	last := s.Queued()[len(s.Queued())-1]
+	if last.RequestID != "" || last.Model != "D" {
+		t.Fatalf("last queued=%+v want empty RequestID for metadata-less request", last)
+	}
+
+	// An empty queue yields a nil snapshot.
+	noQueue := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, nil, eff)
+	if got := noQueue.Queued(); got != nil {
+		t.Fatalf("Queued()=%v want nil for empty queue", got)
 	}
 }
 

@@ -70,6 +70,42 @@ type FIFO struct {
 	queueTimeout time.Duration // 0 = wait indefinitely
 }
 
+// QueuedInfo describes one request currently waiting in the scheduler queue.
+// QueuePosition is 1-indexed and reflects the queue's service order (priority
+// desc, stable FIFO within equal priority).
+type QueuedInfo struct {
+	RequestID     string
+	Model         string
+	QueuePosition int
+}
+
+// Queued returns a read-only snapshot of the queue in service order. It is
+// safe to call only from the router's single run-loop goroutine, like every
+// other FIFO method — the queue is not synchronized for concurrent access.
+//
+// The snapshot covers only requests sitting in f.queued. Requests joined to an
+// in-progress swap (join waiters) and requests admitted on the fast path are
+// not queued and never appear in it; callers display those as "serving"
+// (approximate v1 stage semantics).
+//
+// RequestID is the inflight tracker ID carried in each request's context via
+// swaputil.WithInflightID; requests without one (unit-test requests, requests
+// that never passed the inflight middleware) report an empty ID.
+func (s *FIFO) Queued() []QueuedInfo {
+	if len(s.queued) == 0 {
+		return nil
+	}
+	out := make([]QueuedInfo, 0, len(s.queued))
+	for i, item := range s.queued {
+		info := QueuedInfo{Model: item.Req.Model, QueuePosition: i + 1}
+		if id, ok := swaputil.InflightID(item.Req.Ctx); ok {
+			info.RequestID = id
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
 // NewFIFO builds a FIFO scheduler. Per-model concurrency limits are derived
 // from models: each model's ConcurrencyLimit overrides defaultConcurrencyLimit
 // when set to a value greater than zero.

@@ -190,6 +190,7 @@
     const cols: ColMeta[] = [
       { id: "cancel", label: "Cancel", defaultVisible: true },
       { id: "elapsed", label: "Elapsed", defaultVisible: true },
+      { id: "stage", label: "Stage", defaultVisible: true },
     ];
     if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
     cols.push(
@@ -752,6 +753,17 @@
                     <span class="font-mono text-xs tabular-nums">
                       {formatInflightElapsed(request, inflightNowMs)}
                     </span>
+                  {:else if columnId === "stage"}
+                    {#if (request.stage ?? "serving") === "queued"}
+                      <span class="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium whitespace-nowrap text-amber-600 dark:text-amber-400">
+                        排队中
+                        {#if request.queue_position != null}<span class="tabular-nums">#{request.queue_position}</span>{/if}
+                      </span>
+                    {:else}
+                      <span class="inline-flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium whitespace-nowrap text-emerald-600 dark:text-emerald-400">
+                        推理中
+                      </span>
+                    {/if}
                   {:else if columnId === "model"}
                     <MiddleEllipsis value={request.model} tailLength={10} className="max-w-[14rem]" />
                   {:else if columnId === "request"}

@@ -222,12 +222,14 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:           cfg,
-		muxlog:        muxlog,
-		proxylog:      proxylog,
-		upstreamlog:   upstreamlog,
-		perf:          perfMon,
-		inflight:      newInflightTracker(),
+		cfg:         cfg,
+		muxlog:      muxlog,
+		proxylog:    proxylog,
+		upstreamlog: upstreamlog,
+		perf:        perfMon,
+		inflight: newInflightTrackerWithQueueSnapshot(func() []router.QueueInfo {
+			return local.QueueSnapshot()
+		}),
 		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
 		store:         st,
 		build:         build,
