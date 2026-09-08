@@ -1024,3 +1024,159 @@ func TestFIFO_Priority_WarningDedup(t *testing.T) {
 		t.Fatalf("DEBUG lines=%d want %d (repeat occurrences):\n%s", strings.Count(out, "[DEBUG]"), want, out)
 	}
 }
+
+// TestBaseRouter_IngressHeaderSnapshot drives the real ServeHTTP path and
+// asserts the six ingress request headers land in ReqContextData.Metadata
+// under their snake_case keys. It covers the full matrix requested by the
+// feature: all six headers present (with the X-Forwarded-For proxy chain kept
+// whole), no headers present, a subset, and headers whose value is empty.
+// Missing/empty headers must leave no metadata key behind.
+func TestBaseRouter_IngressHeaderSnapshot(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    map[string]string // metadata key → value; absent key means "not present"
+	}{
+		{
+			name: "all six headers snapshotted verbatim",
+			headers: map[string]string{
+				"User-Agent":         "llama-bot/1.0",
+				"X-Forwarded-For":    "203.0.113.9, 198.51.100.2",
+				"X-Forwarded-Host":   "api.example.com",
+				"X-Forwarded-Proto":  "https",
+				"X-Real-Ip":          "203.0.113.9",
+				"X-Request-Priority": "high",
+			},
+			want: map[string]string{
+				"user_agent":         "llama-bot/1.0",
+				"x_forwarded_for":    "203.0.113.9, 198.51.100.2", // full chain, not first hop
+				"x_forwarded_host":   "api.example.com",
+				"x_forwarded_proto":  "https",
+				"x_real_ip":          "203.0.113.9",
+				"x_request_priority": "high",
+			},
+		},
+		{
+			name:    "no headers write no keys",
+			headers: nil,
+			want:    map[string]string{},
+		},
+		{
+			name: "missing headers leave no key",
+			headers: map[string]string{
+				"User-Agent": "curl/8.0",
+				"X-Real-Ip":  "198.51.100.7",
+			},
+			want: map[string]string{
+				"user_agent": "curl/8.0",
+				"x_real_ip":  "198.51.100.7",
+			},
+		},
+		{
+			name: "empty header value writes no key",
+			headers: map[string]string{
+				"X-Forwarded-For":    "",
+				"X-Request-Priority": "",
+			},
+			want: map[string]string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTestBase(t, nil, &stubPlanner{})
+			cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+			b.schedule = cap
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := newRequest("a").WithContext(ctx)
+			for name, value := range tc.headers {
+				r.Header.Set(name, value)
+			}
+
+			serveDone := make(chan struct{})
+			go func() {
+				b.ServeHTTP(httptest.NewRecorder(), r)
+				close(serveDone)
+			}()
+
+			var req scheduler.HandlerReq
+			select {
+			case req = <-cap.got:
+			case <-time.After(2 * time.Second):
+				t.Fatal("scheduler never received the request")
+			}
+
+			data, ok := swaputil.ReadContext(req.Ctx)
+			if !ok {
+				t.Fatal("request context data missing")
+			}
+			for _, h := range ingressHeaderSnapshots {
+				want, wantPresent := tc.want[h.key]
+				got, gotPresent := data.Metadata[h.key]
+				switch {
+				case !wantPresent && gotPresent:
+					t.Errorf("metadata[%q]=%q, want no key", h.key, got)
+				case wantPresent && !gotPresent:
+					t.Errorf("metadata[%q] missing, want %q", h.key, want)
+				case wantPresent && got != want:
+					t.Errorf("metadata[%q]=%q, want %q", h.key, got, want)
+				}
+			}
+
+			cancel()
+			select {
+			case <-serveDone:
+			case <-time.After(time.Second):
+				t.Fatal("ServeHTTP did not return after context cancel")
+			}
+		})
+	}
+}
+
+// TestBaseRouter_IngressHeaderSnapshot_MultiLineXFF covers HTTP/1.1's
+// multi-line delivery of the same header name for X-Forwarded-For, which some
+// proxies emit. Header.Get alone would silently keep only the first line and
+// drop later hops — this test pins the join behavior: every line is kept, in
+// order, joined by ", " (probed: Header.Get returns "10.0.0.1, 10.0.0.2" here,
+// so the old first-line-only implementation would fail this assertion).
+func TestBaseRouter_IngressHeaderSnapshot_MultiLineXFF(t *testing.T) {
+	b := newTestBase(t, nil, &stubPlanner{})
+	cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+	b.schedule = cap
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := newRequest("a").WithContext(ctx)
+	r.Header.Add("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	r.Header.Add("X-Forwarded-For", "172.16.0.1")
+
+	serveDone := make(chan struct{})
+	go func() {
+		b.ServeHTTP(httptest.NewRecorder(), r)
+		close(serveDone)
+	}()
+
+	var req scheduler.HandlerReq
+	select {
+	case req = <-cap.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler never received the request")
+	}
+
+	data, ok := swaputil.ReadContext(req.Ctx)
+	if !ok {
+		t.Fatal("request context data missing")
+	}
+	if got := data.Metadata["x_forwarded_for"]; got != "10.0.0.1, 10.0.0.2, 172.16.0.1" {
+		t.Errorf("x_forwarded_for=%q, want %q (full multi-line chain)", got, "10.0.0.1, 10.0.0.2, 172.16.0.1")
+	}
+
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("ServeHTTP did not return after context cancel")
+	}
+}
