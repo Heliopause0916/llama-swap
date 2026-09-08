@@ -376,7 +376,7 @@ func (s *FIFO) OnShutdown(err error) {
 // Concurrency-limit rejection happens earlier in admit, before a request can
 // start the loading stream.
 func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
-	if err := swaputil.SetReqData(req.Ctx, "fifo_priority", strconv.Itoa(s.cfg.Priority[req.Model])); err != nil {
+	if err := swaputil.SetReqData(req.Ctx, "fifo_priority", strconv.Itoa(req.Priority)); err != nil {
 		s.logger.Debugf("failed to set fifo_priority metadata: %v", err)
 	}
 
@@ -505,14 +505,16 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 }
 
 // enqueue inserts req into the queue in priority order: it goes just before the
-// first queued item whose priority is strictly lower, so higher-priority models
-// are serviced first while equal-priority requests keep their arrival (FIFO)
-// order. Priorities come from the FifoConfig; unlisted models default to 0.
+// first queued item whose priority is strictly lower, so higher-priority
+// requests are serviced first while equal-priority requests keep their arrival
+// (FIFO) order. Priority is the request's effective request-level priority set
+// at ingress; it is always > 0 (0 is normalized away before the scheduler is
+// reached, see docs/design/request-priority.md §7).
 func (s *FIFO) enqueue(req HandlerReq, deadline time.Time) {
-	p := s.cfg.Priority[req.Model]
+	p := req.Priority
 	i := len(s.queued)
 	for j, q := range s.queued {
-		if s.cfg.Priority[q.Req.Model] < p {
+		if q.Req.Priority < p {
 			i = j
 			break
 		}

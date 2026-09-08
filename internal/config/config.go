@@ -239,7 +239,22 @@ type SchedulerSettings struct {
 }
 
 type FifoConfig struct {
-	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// PriorityHeader is the header name read once at ingress to resolve a
+	// request's priority band (docs/design/request-priority.md §6). When
+	// multiple same-name values are present the first wins. Defaults to
+	// X-Request-Priority.
+	PriorityHeader string `yaml:"priorityHeader"`
+
+	// RequestPriority maps a band word (normalized to lowercase at load) to
+	// its numeric priority value. Empty (absent or {}) disables request-level
+	// priority entirely: the header is never read and every request resolves
+	// to DefaultPriority. Values must be > 0 and unique across bands.
+	RequestPriority map[string]int `yaml:"requestPriority"`
+
+	// DefaultPriority is the fallback band used when the header is absent,
+	// blank, or unknown. When requestPriority is enabled it must equal one of
+	// the declared band values (no orphan defaults). Defaults to 60.
+	DefaultPriority int `yaml:"defaultPriority"`
 
 	// PATCH(v255): queueing for over-limit requests
 	// QueueDepth is the number of requests that may wait in the queue while a

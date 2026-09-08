@@ -176,6 +176,15 @@ func req(model string) HandlerReq {
 	}
 }
 
+// reqP creates a request carrying the given effective priority — the value
+// resolvePriority would have produced at ingress (docs/design/
+// request-priority.md §7).
+func reqP(model string, priority int) HandlerReq {
+	r := req(model)
+	r.Priority = priority
+	return r
+}
+
 // reqCh creates a HandlerReq with a unique Respond channel so OnCancel can
 // identify it among queued requests and swap waiters.
 func reqCh(model string) HandlerReq {
@@ -315,14 +324,15 @@ func TestFIFO_FastPath(t *testing.T) {
 	}
 }
 
-func TestFIFO_GrantSetsPriorityMetadata(t *testing.T) {
+// TestFIFO_Priority_GrantMetadata verifies the fifo_priority activity metadata
+// written at grant time carries the request's effective priority (§9/D10).
+func TestFIFO_Priority_GrantMetadata(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateReady
-	cfg := config.FifoConfig{Priority: map[string]int{"a": 7}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, nil, eff)
+	s := newFIFO(&stubPlanner{}, eff)
 
 	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: "a", Metadata: make(map[string]string)})
-	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx})
+	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx, Priority: 60})
 
 	if got := eff.served("a"); got != 1 {
 		t.Fatalf("served(a)=%d want 1", got)
@@ -331,8 +341,8 @@ func TestFIFO_GrantSetsPriorityMetadata(t *testing.T) {
 	if !ok {
 		t.Fatal("context data missing from granted request")
 	}
-	if data.Metadata["fifo_priority"] != "7" {
-		t.Errorf("fifo_priority = %q, want 7", data.Metadata["fifo_priority"])
+	if data.Metadata["fifo_priority"] != "60" {
+		t.Errorf("fifo_priority = %q, want 60", data.Metadata["fifo_priority"])
 	}
 }
 
@@ -680,9 +690,10 @@ func TestFIFO_OnUnload_DropsQueuedRequests(t *testing.T) {
 	}
 }
 
-// TestFIFO_PriorityQueueOrder verifies queued requests are ordered by descending
-// priority, with arrival (FIFO) order preserved among equal-priority models.
-func TestFIFO_PriorityQueueOrder(t *testing.T) {
+// TestFIFO_Priority_QueueOrdering verifies queued requests are ordered by
+// descending effective priority, with arrival (FIFO) order preserved among
+// equal-priority requests.
+func TestFIFO_Priority_QueueOrdering(t *testing.T) {
 	eff := newFakeEffects()
 	for _, m := range []string{"z", "A", "B", "C", "D"} {
 		eff.states[m] = process.StateStopped
@@ -690,14 +701,14 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 	// z's swap evicts every other model, so any request that arrives while z is
 	// loading collides with z's in-flight swap and parks in the queue.
 	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
-	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
+	s := newFIFO(planner, eff)
 
 	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D])
 
 	// Arrive out of priority order; B before C exercises FIFO tie-breaking.
+	priority := map[string]int{"A": 100, "B": 60, "C": 60, "D": 30}
 	for _, m := range []string{"B", "D", "C", "A"} {
-		s.OnRequest(req(m))
+		s.OnRequest(reqP(m, priority[m]))
 	}
 
 	got := make([]string, len(s.queued))
@@ -715,24 +726,58 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 	}
 }
 
-// TestFIFO_Queued mirrors TestFIFO_PriorityQueueOrder's queue construction and
-// verifies the read-only snapshot: service order, 1-indexed positions, and the
-// inflight ID read back from each request's context metadata.
+// TestFIFO_Priority_QueueStableForEqual verifies one-band traffic keeps pure
+// arrival order: equal priorities never reorder the queue.
+func TestFIFO_Priority_QueueStableForEqual(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"z", "a", "b", "c"} {
+		eff.states[m] = process.StateStopped
+	}
+	// z's swap evicts everything else, forcing a, b, c into the queue.
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a", "b", "c"}}}
+	s := newFIFO(planner, eff)
+
+	s.OnRequest(req("z")) // StartSwap(z, [a,b,c])
+
+	for _, m := range []string{"a", "b", "c"} {
+		s.OnRequest(reqP(m, 60)) // all one band
+	}
+
+	got := make([]string, len(s.queued))
+	for i, q := range s.queued {
+		got[i] = q.Req.Model
+	}
+	want := []string{"a", "b", "c"} // arrival order preserved
+	if len(got) != len(want) {
+		t.Fatalf("queue=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("queue=%v want %v", got, want)
+		}
+	}
+}
+
+// TestFIFO_Queued mirrors TestFIFO_Priority_QueueOrdering's queue construction
+// and verifies the read-only snapshot: service order, 1-indexed positions, and
+// the inflight ID read back from each request's context metadata.
 func TestFIFO_Queued(t *testing.T) {
 	eff := newFakeEffects()
 	for _, m := range []string{"z", "A", "B", "C", "D"} {
 		eff.states[m] = process.StateStopped
 	}
 	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
-	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
+	s := newFIFO(planner, eff)
 
 	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D]) — the rest queue
 
 	// Arrive out of priority order, each carrying a unique inflight ID.
+	priority := map[string]int{"A": 100, "B": 60, "C": 60, "D": 30}
 	ids := map[string]string{"B": "b-1", "D": "d-2", "C": "c-3", "A": "a-4"}
 	for _, m := range []string{"B", "D", "C", "A"} {
-		s.OnRequest(reqWithID(m, ids[m]))
+		r := reqWithID(m, ids[m])
+		r.Priority = priority[m]
+		s.OnRequest(r)
 	}
 
 	// Queue order is priority desc (A,B,C,D); positions are 1-indexed.
@@ -753,9 +798,9 @@ func TestFIFO_Queued(t *testing.T) {
 	}
 
 	// Requests without an inflight ID in their context yield an empty ID
-	// rather than failing the snapshot: a D (priority 1) slots in behind
+	// rather than failing the snapshot: a second D (same band) slots in behind
 	// the existing D at the tail.
-	s.OnRequest(req("D")) // second D queues at the tail without an ID
+	s.OnRequest(reqP("D", priority["D"])) // second D queues at the tail without an ID
 	last := s.Queued()[len(s.Queued())-1]
 	if last.RequestID != "" || last.Model != "D" {
 		t.Fatalf("last queued=%+v want empty RequestID for metadata-less request", last)

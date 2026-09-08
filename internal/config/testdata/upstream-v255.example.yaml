@@ -1,0 +1,53 @@
+# Fixture: official upstream v255-compatible config shape with the legacy
+# model-level `priority:` key under routing.scheduler.settings.fifo.
+#
+# Provenance: the fifo block (use/settings/fifo with the priority dictionary)
+# is extracted VERBATIM from docs/config.example.yaml at git 6384ea93~1 (the
+# pre-queueing fork tree, i.e. the upstream v255-era config shape). The full
+# example cannot be loaded verbatim: its `unlisted-model` uses neither cmd nor
+# proxy, so the default proxy injection (MODEL_CONFIG_DEFAULT_PROXY) trips the
+# unrelated "${PORT} is only available when used in cmd" check. Only
+# scaffolding (a minimal model list) is substituted; the priority lines are
+# untouched.
+#
+# Same shape as produced by `git show 6384ea93~1:docs/config.example.yaml`:
+#   fifo:
+#     # priority: a dictionary of model ID -> priority
+#     # - optional, default: empty dictionary
+#     # - models default to priority 0
+#     # - higher priority requests are serviced first in the queue
+#     priority:
+#       A: 10
+#       B: 5
+#       C: 5
+#       D: 1
+models:
+  A:
+    cmd: /path/to/llama-server --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+  B:
+    cmd: /path/to/llama-server --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+  C:
+    cmd: /path/to/llama-server --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+  D:
+    cmd: /path/to/llama-server --port ${PORT}
+    proxy: http://127.0.0.1:${PORT}
+
+# routing: optional section. The scheduler is FIFO; priority is the official
+# v255 key and must be accepted (with a deprecation warning) on this fork.
+routing:
+  scheduler:
+    use: fifo
+    settings:
+      fifo:
+        # priority: a dictionary of model ID -> priority
+        # - optional, default: empty dictionary
+        # - models default to priority 0
+        # - higher priority requests are serviced first in the queue
+        priority:
+          A: 10
+          B: 5
+          C: 5
+          D: 1

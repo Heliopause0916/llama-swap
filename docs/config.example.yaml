@@ -688,15 +688,11 @@ routing:
     use: fifo
     settings:
       fifo:
-        # priority: a dictionary of model ID -> priority
-        # - optional, default: empty dictionary
-        # - models default to priority 0
-        # - higher priority requests are serviced first in the queue
-        priority:
-          A: 10
-          B: 5
-          C: 5
-          D: 1
+        # requestPriority: band word -> numeric priority value.
+        # - optional; an empty map ({}) = feature off, the header is never read
+        #   and every request resolves to defaultPriority
+        #   (see docs/design/request-priority.md)
+        requestPriority: {}
 
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary

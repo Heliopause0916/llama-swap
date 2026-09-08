@@ -130,7 +130,8 @@ versus a mid-size LLM plus TTS. Groups cannot express that; matrix can.
 
 ## Request ordering
 
-Queued requests are FIFO. You can give some models priority:
+Queued requests are FIFO. Requests can declare a priority band via the
+`X-Request-Priority` header, mapped to a numeric value by the scheduler:
 
 ```yaml
 routing:
@@ -138,12 +139,16 @@ routing:
     use: fifo
     settings:
       fifo:
-        priority:
-          interactive-model: 10
-          batch-model: 1
+        requestPriority:      # empty map = feature off
+          high: 100
+          medium: 60          # also the default fallback band
+          low: 30
+        defaultPriority: 60
 ```
 
-Higher numbers are serviced first. Models default to 0.
+Higher numbers are serviced first; equal priorities keep arrival order.
+Requests without a recognizable `X-Request-Priority` header land on
+`defaultPriority`. The legacy model-level `priority` key has been removed.
 
 ## Related
 

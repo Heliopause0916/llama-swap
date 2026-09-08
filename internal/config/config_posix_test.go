@@ -297,6 +297,15 @@ groups:
 			},
 			Scheduler: SchedulerConfig{
 				Use: "fifo",
+				Settings: SchedulerSettings{
+					// load.go applies the request-priority defaults even when
+					// the fifo block is absent (§6 of request-priority.md).
+					Fifo: FifoConfig{
+						PriorityHeader:  "X-Request-Priority",
+						RequestPriority: nil,
+						DefaultPriority: 60,
+					},
+				},
 			},
 		},
 	}

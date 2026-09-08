@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -261,10 +262,52 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.Routing.Scheduler.Use != "fifo" {
 		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo)", config.Routing.Scheduler.Use)
 	}
-	for modelID := range config.Routing.Scheduler.Settings.Fifo.Priority {
-		if _, found := config.RealModelName(modelID); !found {
-			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)
+
+	// Request-level priority (docs/design/request-priority.md §6). The legacy
+	// model-level `priority` key was removed (D1): a leftover entry is accepted
+	// for upstream v255 config compatibility and ignored, with a one-time
+	// deprecation warning (D14). yaml.v3's lenient decode would otherwise
+	// silently drop the key from FifoConfig, so it is detected here against the
+	// raw, macro-expanded YAML tree.
+	fifo := &config.Routing.Scheduler.Settings.Fifo
+	if fifo.PriorityHeader == "" {
+		fifo.PriorityHeader = "X-Request-Priority"
+	}
+	if fifo.DefaultPriority == 0 {
+		// 0 is the legacy "unset" sentinel; normalize to the documented default
+		// (same zero-handling pattern as unloadTimeout above).
+		fifo.DefaultPriority = 60
+	}
+	warnLegacyFifoPriority(raw)
+
+	// Empty requestPriority => feature off, accepted as-is. Non-empty =>
+	// validate: keys non-empty after trimming and normalized to lowercase
+	// (the stored form), values > 0 and unique across bands, and
+	// defaultPriority equal to one of the declared band values.
+	if len(fifo.RequestPriority) > 0 {
+		normalized := make(map[string]int, len(fifo.RequestPriority))
+		values := make(map[int]string, len(fifo.RequestPriority))
+		for band, value := range fifo.RequestPriority {
+			key := strings.ToLower(strings.TrimSpace(band))
+			switch {
+			case key == "":
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority: band name %q is empty after trimming", band)
+			case value <= 0:
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority.%s: value %d must be > 0 (0 is reserved for legacy unset records)", key, value)
+			}
+			if prev, dup := values[value]; dup {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority: bands %q and %q both map to value %d; band values must be unique", prev, key, value)
+			}
+			if _, dup := normalized[key]; dup {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority: band name %q normalizes to %q which is already declared", band, key)
+			}
+			normalized[key] = value
+			values[value] = key
 		}
+		if _, ok := values[fifo.DefaultPriority]; !ok {
+			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.defaultPriority: %d is not one of the declared requestPriority band values; defaultPriority must equal a declared band", fifo.DefaultPriority)
+		}
+		fifo.RequestPriority = normalized
 	}
 
 	// Clean up hooks preload
@@ -359,4 +402,36 @@ func normalizeHeaderNames(names []string) []string {
 		normalized = append(normalized, name)
 	}
 	return normalized
+}
+
+// warnLegacyFifoPriority emits a one-time deprecation warning when a leftover
+// `priority:` key is present under routing.scheduler.settings.fifo. The
+// model-level key was removed with the request-priority feature (D1), but the
+// official upstream v255 config shape still declares it, and upstream-release
+// compat is a hard requirement on this fork: the key must be accepted and
+// ignored, not rejected (D14). The key is detected against the raw,
+// macro-expanded YAML tree because yaml.v3's lenient decode silently drops
+// unknown keys from FifoConfig. Logged via the standard log/slog default
+// logger: internal/config owns no logger of its own, and this repository's
+// binaries (llama-swap.go, cmd/wol-proxy) already emit through slog.
+func warnLegacyFifoPriority(raw map[string]any) {
+	routing, ok := raw["routing"].(map[string]any)
+	if !ok {
+		return
+	}
+	scheduler, ok := routing["scheduler"].(map[string]any)
+	if !ok {
+		return
+	}
+	settings, ok := scheduler["settings"].(map[string]any)
+	if !ok {
+		return
+	}
+	fifo, ok := settings["fifo"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, ok := fifo["priority"]; ok {
+		slog.Warn(`deprecated "routing.scheduler.settings.fifo.priority" key is accepted for upstream compatibility but ignored: model-level priority was removed in favor of request-level priority (requestPriority / X-Request-Priority header); see docs/design/request-priority.md`)
+	}
 }
