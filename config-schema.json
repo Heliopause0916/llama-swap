@@ -221,6 +221,17 @@
             "default": 5,
             "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
         },
+        "audit": {
+            "type": "object",
+            "properties": {
+                "requestHeaders": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable snapshotting the six ingress request headers (User-Agent, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, X-Real-Ip, X-Request-Priority) into activity record metadata under snake_case keys. Optional, default false (disabled)."
+                }
+            },
+            "description": "Optional request audit snapshots recorded into activity log metadata."
+        },
         "store": {
             "type": "object",
             "properties": {

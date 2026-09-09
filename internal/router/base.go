@@ -528,7 +528,11 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// any dispatch decision: ServeHTTP is the one place that sees both the
 	// raw *http.Request and the context's metadata map. The captured values
 	// ride along with fifo_priority/priority into the activity record.
-	snapshotIngressHeaders(req.Context(), req)
+	// Opt-in via audit.requestHeaders (default off); when disabled no
+	// snapshot keys are written and the audit feature has no effect.
+	if b.config.Audit.RequestHeaders {
+		snapshotIngressHeaders(req.Context(), req)
+	}
 
 	// Ignored websocket connections are deliberately kept outside the
 	// scheduler: they cannot start or queue a model, consume concurrency, or

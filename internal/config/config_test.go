@@ -116,6 +116,34 @@ store:
 	})
 }
 
+func TestConfig_AuditRequestHeaders(t *testing.T) {
+	t.Run("default disabled when key absent", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+healthCheckTimeout: 15
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.Audit.RequestHeaders)
+	})
+
+	t.Run("enabled when audit.requestHeaders is true", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+audit:
+  requestHeaders: true
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.Audit.RequestHeaders)
+	})
+
+	t.Run("explicit false stays disabled", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+audit:
+  requestHeaders: false
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.Audit.RequestHeaders)
+	})
+}
+
 func TestConfig_FindConfig(t *testing.T) {
 
 	// TODO?

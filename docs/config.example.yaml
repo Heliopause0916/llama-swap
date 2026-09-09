@@ -63,6 +63,15 @@ metricsMaxInMemory: 1000
 # - set to 0 to disable
 captureBuffer: 15
 
+# audit.requestHeaders: snapshot the six ingress request headers (User-Agent,
+# X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, X-Real-Ip,
+# X-Request-Priority) into the activity record metadata under snake_case keys
+# (e.g. user_agent, x_forwarded_for) for audit purposes
+# - optional, default: false (disabled)
+# - set to true to enable the request header audit snapshots
+# audit:
+#   requestHeaders: true
+
 # ui.activity.session_id: ordered request headers used to identify sessions in
 # the Activity page's in-flight request table.
 # - optional, default: ["X-Session-ID", "X-Litellm-Session-Id"]

@@ -210,6 +210,7 @@ groups:
 			},
 		},
 		SendLoadingState: false,
+		Audit:            AuditConfig{},
 		UnloadTimeout:    DEFAULT_UNLOAD_TIMEOUT,
 		Models: map[string]ModelConfig{
 			"model1": {

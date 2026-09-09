@@ -128,6 +128,16 @@ type UIActivityConfig struct {
 	SessionID []string `yaml:"session_id" json:"session_id"`
 }
 
+// AuditConfig controls optional request audit snapshots recorded into the
+// activity log metadata.
+type AuditConfig struct {
+	// RequestHeaders enables snapshotting the six ingress request headers
+	// (User-Agent, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto,
+	// X-Real-Ip, X-Request-Priority) into the activity record metadata under
+	// their snake_case keys. Optional, default false (disabled).
+	RequestHeaders bool `yaml:"requestHeaders" json:"requestHeaders"`
+}
+
 // ProfileConfig describes a runtime-selectable set of model ID rewrites.
 // Empty pin targets disable the corresponding model ID while the profile is
 // active. YAML null values decode to the same empty string representation.
@@ -155,6 +165,7 @@ type Config struct {
 	Tailcat            *TailcatConfig            `yaml:"tailcat"`
 	HealthCheckTimeout int                       `yaml:"healthCheckTimeout"`
 	LogRequests        bool                      `yaml:"logRequests"`
+	Audit              AuditConfig               `yaml:"audit"`
 	LogLevel           string                    `yaml:"logLevel"`
 	LogTimeFormat      string                    `yaml:"logTimeFormat"`
 	LogToStdout        string                    `yaml:"logToStdout"`
