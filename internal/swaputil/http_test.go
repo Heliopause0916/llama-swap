@@ -992,3 +992,21 @@ func TestSendError_MapsSentinelErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestForceSwitchContext(t *testing.T) {
+	if ForceSwitch(context.Background()) {
+		t.Fatal("unmarked context reports ForceSwitch=true")
+	}
+
+	ctx := WithForceSwitch(context.Background())
+	if !ForceSwitch(ctx) {
+		t.Fatal("marked context reports ForceSwitch=false")
+	}
+
+	// The marker must survive a later SetContext: handleUpstream stamps the
+	// marker and then pins the resolved model into the same context chain.
+	pinned := SetContext(ctx, ReqContextData{Model: "m1", ModelID: "m1"})
+	if !ForceSwitch(pinned) {
+		t.Fatal("force-switch marker lost after SetContext")
+	}
+}

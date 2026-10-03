@@ -116,10 +116,15 @@ type HandlerReq struct {
 	// no rewrite happened. Display/metadata only — never used as a scheduling
 	// key.
 	RequestedModel string
-	Ctx            context.Context
-	Admit          chan error
-	Respond        chan HandlerResp
-	PositionCh     chan int
+	// ForceSwitch marks requests that must never be fuzzy-rewritten (stamped
+	// by the server's /upstream/<model>/ handler): the scheduler skips step 0
+	// entirely and runs the normal decision tree, which starts a real switch
+	// — evicting a busy sibling when the group's other member is serving.
+	ForceSwitch bool
+	Ctx         context.Context
+	Admit       chan error
+	Respond     chan HandlerResp
+	PositionCh  chan int
 
 	// Priority is the request's effective request-level priority (> 0),
 	// resolved exactly once at ingress from the X-Request-Priority header (or

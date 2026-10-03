@@ -476,6 +476,11 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	// Pin the resolved model so the router skips body/query extraction.
 	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
 
+	// Explicitly naming a backend is an explicit request to switch to it:
+	// mark the request so the scheduler's fuzzy substitution never rewrites
+	// it to an already-running group member.
+	*r = *r.WithContext(swaputil.WithForceSwitch(r.Context()))
+
 	// If the path matches an upstream.ignorePaths entry and the model is
 	// not already loaded, refuse the request without triggering a swap. The
 	// server was not able to process the response because the model was not

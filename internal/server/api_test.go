@@ -229,6 +229,23 @@ func TestServer_HandleUpstream(t *testing.T) {
 			t.Errorf("status = %d, want 404", w.Code)
 		}
 	})
+
+	t.Run("marks force switch", func(t *testing.T) {
+		local := newStubRouter([]string{"m1"}, "upstream-body")
+		var marked bool
+		local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			marked = swaputil.ForceSwitch(r.Context())
+			w.WriteHeader(http.StatusOK)
+		}
+		s := newTestServer(local, newStubRouter(nil, ""))
+		s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat", nil))
+		if !marked {
+			t.Error("/upstream/ request reached the router without the force-switch marker")
+		}
+	})
 }
 func TestProxy_HandleUpstreamPreservesEscapedPath(t *testing.T) {
 	tests := []struct {

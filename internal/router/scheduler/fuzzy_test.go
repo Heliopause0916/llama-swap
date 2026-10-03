@@ -459,3 +459,148 @@ func TestFIFO_Fuzzy_GrantErrorNoMetadata(t *testing.T) {
 		t.Fatal("served_model leaked on a failed grant")
 	}
 }
+
+func TestFIFO_Fuzzy_ForceSwitch_IdleWindowRealSwitch(t *testing.T) {
+	// Inside the idle window a plain request is rewritten (see
+	// TestFIFO_Fuzzy_IdleWithinWindowKeepsModel); a ForceSwitch request skips
+	// the rewrite entirely and runs the normal decision tree — a real switch
+	// to the asked model, evicting the online sibling.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, clock := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.lastServeDone["g"] = clock.now().Add(-10 * time.Second)
+
+	r := reqMeta("b")
+	r.ForceSwitch = true
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch despite the idle window)", eff.startsFor("b"))
+	}
+	if eff.served("a") != 0 {
+		t.Fatalf("served a=%d want 0", eff.served("a"))
+	}
+	if got := s.active["b"].waiters[0].RequestedModel; got != "" {
+		t.Fatalf("RequestedModel=%q want empty (no rewrite)", got)
+	}
+	if _, ok := metaValue(t, r, "served_model"); ok {
+		t.Fatal("served_model written for a force-switched request")
+	}
+}
+
+func TestFIFO_Fuzzy_ForceSwitch_BusyQueuesNotRewrites(t *testing.T) {
+	// While the online member is busy, a plain request is fuzzed onto it (see
+	// TestFIFO_Fuzzy_BusyServesWithRunningModel). A ForceSwitch request skips
+	// the rewrite and takes the normal tree: it would evict the busy sibling,
+	// so it parks in the queue under its OWN model until the sibling drains,
+	// then starts a real switch.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.inFlight["a"] = 1
+	s.reserved["a"] = 1 // the in-flight request holds its reservation
+
+	r := reqMeta("b")
+	r.ForceSwitch = true
+	s.OnRequest(r)
+
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1 (queued on the busy sibling, not rewritten)", len(s.queued))
+	}
+	if s.queued[0].Req.Model != "b" {
+		t.Fatalf("queued[0].Model=%q want %q", s.queued[0].Req.Model, "b")
+	}
+	if got := s.queued[0].Req.RequestedModel; got != "" {
+		t.Fatalf("RequestedModel=%q want empty (no rewrite)", got)
+	}
+	if eff.startsFor("a") != 0 || eff.startsFor("b") != 0 {
+		t.Fatalf("starts a=%d b=%d want none while the sibling is busy", eff.startsFor("a"), eff.startsFor("b"))
+	}
+
+	// When the busy sibling drains, the queued force-switch request starts a
+	// real switch to b.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 after the sibling drained", eff.startsFor("b"))
+	}
+	if _, ok := metaValue(t, r, "served_model"); ok {
+		t.Fatal("served_model written for a force-switched request")
+	}
+}
+
+func TestFIFO_Fuzzy_BusyNoOnline_QueueHeadFollows(t *testing.T) {
+	// The group's online member was just unloaded, leaving the group busy with
+	// queued traffic but no online model and no active swap. The first model
+	// the group's traffic is committed to — here the queue head "b" — decides
+	// the switch target: a later request for "c" is rewritten to "b" instead
+	// of starting a competing swap for c.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	eff.states["c"] = process.StateStopped
+	s, clock := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	s.queued = append(s.queued, queuedItem{Req: reqCh("b"), EnqueuedAt: clock.now()})
+
+	r := reqMeta("c")
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (queue head decides the target)", eff.startsFor("b"))
+	}
+	if eff.startsFor("c") != 0 {
+		t.Fatalf("starts for c=%d want 0", eff.startsFor("c"))
+	}
+	sw := s.active["b"]
+	if len(sw.waiters) != 1 || sw.waiters[0].RequestedModel != "c" {
+		t.Fatalf("waiters=%d RequestedModel=%q want 1/%q", len(sw.waiters), sw.waiters[0].RequestedModel, "c")
+	}
+}
+
+func TestFIFO_Fuzzy_BusyNoOnline_FollowsInFlightMember(t *testing.T) {
+	// Queue empty but a member still has in-flight requests (e.g. it was
+	// unloaded while its handlers drain): the in-flight member decides the
+	// switch target.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.inFlight["a"] = 1
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.startsFor("a") != 1 {
+		t.Fatalf("starts for a=%d want 1 (in-flight member decides the target)", eff.startsFor("a"))
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+	sw := s.active["a"]
+	if len(sw.waiters) != 1 || sw.waiters[0].RequestedModel != "b" {
+		t.Fatalf("waiters=%d RequestedModel=%q want 1/%q", len(sw.waiters), sw.waiters[0].RequestedModel, "b")
+	}
+}
+
+func TestFIFO_Fuzzy_BusyNoOnline_NotBusyRealSwitch(t *testing.T) {
+	// Control: with no online member and no busy traffic at all, the rule must
+	// not fire — the request keeps its own model and performs a real switch.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch, group not busy)", eff.startsFor("b"))
+	}
+	if eff.startsFor("a") != 0 {
+		t.Fatalf("starts for a=%d want 0", eff.startsFor("a"))
+	}
+	if got := s.active["b"].waiters[0].RequestedModel; got != "" {
+		t.Fatalf("RequestedModel=%q want empty (no rewrite)", got)
+	}
+}

@@ -841,14 +841,30 @@ func broadcastQueuePositions(queued []queuedItem) {
 // fuzzy swap group that is busy or within its idle window, the request is
 // rewritten to the group's online model instead of triggering a switch. The
 // original model is kept in RequestedModel for display/metadata only. Requests
-// outside fuzzy groups pass through unchanged.
+// outside fuzzy groups pass through unchanged. ForceSwitch requests (e.g. the
+// /upstream/<model>/ "load" route) skip every rewrite and run the normal
+// decision tree for a real switch.
 func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
 	gid, ok := s.fuzzy.groupOf[req.Model]
 	if !ok {
 		return req
 	}
+	if req.ForceSwitch {
+		return req
+	}
 	served := s.fuzzyOnline(gid)
-	if served == "" || served == req.Model {
+	if served == "" {
+		// Busy but with no online member: the group's traffic has already
+		// committed to a model — follow it instead of starting a competing
+		// swap for the newly asked model (see fuzzyFollowGroup).
+		if target := s.fuzzyFollowGroup(gid); target != "" && target != req.Model {
+			s.logger.Debugf("%s: fuzzy group %s busy without an online member; following %s", s.name, gid, target)
+			req.RequestedModel = req.Model
+			req.Model = target
+		}
+		return req
+	}
+	if served == req.Model {
 		return req
 	}
 	if !s.fuzzyApplies(gid) {
@@ -858,6 +874,33 @@ func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
 	req.RequestedModel = req.Model
 	req.Model = served
 	return req
+}
+
+// fuzzyFollowGroup implements the busy-without-online rule: when a fuzzy group
+// is busy but has no online member and no in-flight swap targeting one (the
+// fuzzyOnline "" case), a new request follows the model the group's traffic is
+// already committed to — the earliest queued group member (the queue head)
+// first, else a member that still has in-flight requests (e.g. a member that
+// was just unloaded while its handlers drain). Empty when neither source has a
+// group member, in which case no switch target can be decided and the request
+// keeps its own model.
+func (s *FIFO) fuzzyFollowGroup(gid string) string {
+	for _, item := range s.queued {
+		if s.memberOf(item.Req.Model) == gid {
+			return item.Req.Model
+		}
+	}
+	var serving []string
+	for m, n := range s.inFlight {
+		if n > 0 && s.memberOf(m) == gid {
+			serving = append(serving, m)
+		}
+	}
+	if len(serving) > 0 {
+		sort.Strings(serving)
+		return serving[0]
+	}
+	return ""
 }
 
 // fuzzyOnline returns the model an incoming request would be fuzzed onto: the

@@ -579,10 +579,11 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// Unbuffered: a successful send on Respond proves the waiter is
 		// alive and consuming. grant() relies on this to avoid handing a
 		// handleFunc to a cancelled waiter and leaking the inFlight count.
-		Admit:      make(chan error, 1),
-		Respond:    make(chan scheduler.HandlerResp),
-		PositionCh: make(chan int, 1),
-		Priority:   p,
+		Admit:       make(chan error, 1),
+		Respond:     make(chan scheduler.HandlerResp),
+		PositionCh:  make(chan int, 1),
+		Priority:    p,
+		ForceSwitch: swaputil.ForceSwitch(req.Context()),
 	}
 
 	select {

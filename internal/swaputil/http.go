@@ -60,6 +60,28 @@ func InflightID(ctx context.Context) (string, bool) {
 	return id, ok
 }
 
+// forceSwitchContextKey marks requests that must trigger a real model switch
+// and never be rewritten to an already-serving group member. Like
+// inflightIDContextKey it is a context value rather than a ReqContextData
+// field: it is router plumbing, not user-facing request data. The server's
+// /upstream/<model>/ handler stamps it — explicitly naming a backend is an
+// explicit request to switch to it.
+type forceSwitchContextKey struct{}
+
+// WithForceSwitch returns a context marking the request for a forced switch.
+func WithForceSwitch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceSwitchContextKey{}, true)
+}
+
+// ForceSwitch reports whether the request context was marked by WithForceSwitch.
+func ForceSwitch(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(forceSwitchContextKey{}).(bool)
+	return v
+}
+
 var (
 	ReqContextKey        = &contextkey{"context"}
 	ErrNoModelInContext  = fmt.Errorf("no model in request context")
