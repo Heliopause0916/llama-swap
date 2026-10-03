@@ -37,6 +37,29 @@ type ReqContextData struct {
 
 const MaxMultiPartSize = 32 << 20
 
+// inflightIDContextKey is the context key under which the inflight tracker's
+// request ID travels with a request. It is deliberately a context value rather
+// than a ReqContextData.Metadata entry: Metadata is user-facing (it lands in
+// activity logs and profile/matrix middleware reads it), while the inflight ID
+// is router plumbing. The scheduler's queue snapshot reads the same value from
+// each queued request's context so the tracker can match queue entries to its
+// tracked requests.
+type inflightIDContextKey struct{}
+
+// WithInflightID returns a context carrying the tracker's request ID.
+func WithInflightID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, inflightIDContextKey{}, id)
+}
+
+// InflightID reads the inflight request ID stamped by WithInflightID.
+func InflightID(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	id, ok := ctx.Value(inflightIDContextKey{}).(string)
+	return id, ok
+}
+
 var (
 	ReqContextKey        = &contextkey{"context"}
 	ErrNoModelInContext  = fmt.Errorf("no model in request context")

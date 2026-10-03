@@ -227,6 +227,17 @@
             "default": 5,
             "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
         },
+        "audit": {
+            "type": "object",
+            "properties": {
+                "requestHeaders": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable snapshotting the six ingress request headers (User-Agent, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto, X-Real-Ip, X-Request-Priority) into activity record metadata under snake_case keys. Optional, default false (disabled)."
+                }
+            },
+            "description": "Optional request audit snapshots recorded into activity log metadata."
+        },
         "store": {
             "type": "object",
             "properties": {
@@ -938,12 +949,47 @@
                                 "fifo": {
                                     "type": "object",
                                     "properties": {
+                                        "defaultPriority": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "default": 60,
+                                            "description": "Fallback band value used when the priority header is absent, blank, or unknown. When requestPriority is enabled it must equal one of the declared band values. Defaults to 60."
+                                        },
+                                        "priorityHeader": {
+                                            "type": "string",
+                                            "default": "X-Request-Priority",
+                                            "description": "Header name read once at ingress to resolve a request's priority band. Defaults to X-Request-Priority. When multiple same-name values are present, the first wins."
+                                        },
                                         "priority": {
                                             "type": "object",
-                                            "description": "Per-model priority. Keys are model IDs, values are integers (default 0). Higher values are serviced first.",
+                                            "deprecated": true,
+                                            "description": "Accepted for upstream v255 compatibility; ignored at load. Model-level priority is removed — use requestPriority (and the X-Request-Priority header it maps) for per-request priority.",
                                             "additionalProperties": {
                                                 "type": "integer"
                                             }
+                                        },
+                                        "requestPriority": {
+                                            "type": "object",
+                                            "description": "Maps a band word to a numeric priority value; higher values are serviced first. Keys are normalized to lowercase at load; values must be greater than 0 and unique across bands. An empty map (or absent) loads successfully and disables the feature: the header is never read and every request resolves to defaultPriority.",
+                                            "additionalProperties": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            }
+                                        },
+                                        "queueDepth": {
+                                            "type": "integer",
+                                            "description": "How many over-limit requests may wait in the queue. Default 10; 0 disables queueing and over-limit requests are rejected with 429.",
+                                            "default": 10
+                                        },
+                                        "queueTimeout": {
+                                            "type": "integer",
+                                            "description": "How long (seconds) an over-limit request may wait in the queue before being rejected with 429 + Retry-After. Default 60; 0 waits indefinitely.",
+                                            "default": 60
+                                        },
+                                        "promoteAfter": {
+                                            "type": "integer",
+                                            "description": "L1.5 request-priority aging: how long (seconds) an over-limit request may wait in the queue before it is pinned, at the next drain, to the scheduler-internal top tier so it is serviced ahead of every newer arrival (a bounded-wait guarantee against starvation). nil or 0 disables the feature (L1 behavior unchanged); a negative value is rejected at load; when enabled the value must be smaller than the effective queueTimeout and every requestPriority band value / defaultPriority must stay below 2147483647 (see docs/design/request-priority.md §17).",
+                                            "default": 0
                                         }
                                     },
                                     "additionalProperties": false

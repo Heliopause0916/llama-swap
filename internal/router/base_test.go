@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,33 @@ func (s *stubPlanner) EvictionFor(target string, _ []string) []string {
 	return s.evict[target]
 }
 func (s *stubPlanner) OnSwapStart(string, []string) {}
+
+// stubQueueScheduler implements scheduler.Scheduler plus the
+// queueSnapshotProvider interface, reporting a fixed queue snapshot. It lets
+// QueueSnapshot's run-loop round-trip be tested without orchestrating a real
+// FIFO queue.
+type stubQueueScheduler struct {
+	queued []scheduler.QueuedInfo
+}
+
+func (s *stubQueueScheduler) OnRequest(scheduler.HandlerReq)       {}
+func (s *stubQueueScheduler) OnCancel(scheduler.HandlerReq)        {}
+func (s *stubQueueScheduler) OnSwapDone(scheduler.SwapDone)        {}
+func (s *stubQueueScheduler) OnServeDone(scheduler.ServeDoneEvent) {}
+func (s *stubQueueScheduler) OnUnload([]string, time.Duration)     {}
+func (s *stubQueueScheduler) OnShutdown(error)                     {}
+func (s *stubQueueScheduler) Queued() []scheduler.QueuedInfo       { return s.queued }
+
+// stubNoQueueScheduler implements scheduler.Scheduler without the
+// queueSnapshotProvider interface: baseRouter.QueueSnapshot must return nil.
+type stubNoQueueScheduler struct{}
+
+func (s *stubNoQueueScheduler) OnRequest(scheduler.HandlerReq)       {}
+func (s *stubNoQueueScheduler) OnCancel(scheduler.HandlerReq)        {}
+func (s *stubNoQueueScheduler) OnSwapDone(scheduler.SwapDone)        {}
+func (s *stubNoQueueScheduler) OnServeDone(scheduler.ServeDoneEvent) {}
+func (s *stubNoQueueScheduler) OnUnload([]string, time.Duration)     {}
+func (s *stubNoQueueScheduler) OnShutdown(error)                     {}
 
 func newTestBase(t *testing.T, processes map[string]process.Process, planner scheduler.Swapper) *baseRouter {
 	t.Helper()
@@ -113,6 +141,44 @@ func TestBaseRouter_RunningStatus(t *testing.T) {
 	ready.setState(process.StateStopped)
 	if _, ok := b.RunningStatus()["ready"]; ok {
 		t.Errorf("stopped process should be excluded from RunningStatus")
+	}
+}
+
+// TestBaseRouter_QueueSnapshot verifies the run-loop round-trip that reads the
+// scheduler queue: entries arrive in scheduler order, a scheduler without the
+// snapshot provider yields nil, and an empty queue yields nil.
+func TestBaseRouter_QueueSnapshot(t *testing.T) {
+	b := newTestBase(t, nil, &stubPlanner{})
+
+	b.schedule = &stubQueueScheduler{queued: []scheduler.QueuedInfo{
+		{RequestID: "r1", Model: "a", QueuePosition: 1},
+		{RequestID: "r2", Model: "b", QueuePosition: 2},
+	}}
+
+	got := b.QueueSnapshot()
+	want := []QueueInfo{
+		{RequestID: "r1", Model: "a", QueuePosition: 1},
+		{RequestID: "r2", Model: "b", QueuePosition: 2},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("QueueSnapshot()=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("QueueSnapshot()=%v want %v", got, want)
+		}
+	}
+
+	// A scheduler that does not expose its queue yields nil.
+	b.schedule = &stubNoQueueScheduler{}
+	if got := b.QueueSnapshot(); got != nil {
+		t.Fatalf("QueueSnapshot()=%v want nil for scheduler without provider", got)
+	}
+
+	// An empty queue yields nil.
+	b.schedule = &stubQueueScheduler{}
+	if got := b.QueueSnapshot(); got != nil {
+		t.Fatalf("QueueSnapshot()=%v want nil for empty queue", got)
 	}
 }
 
@@ -594,8 +660,19 @@ func TestBaseRouter_ModelNotFound(t *testing.T) {
 
 func TestBaseRouter_ConcurrencyLimitRejectsBeforeLoadingStream(t *testing.T) {
 	sendLoading := true
+	// PATCH(v255): over-limit queueing defaults to ON, so this test explicitly
+	// disables it (queueDepth=0) to keep asserting the legacy 429 semantics:
+	// an over-limit request is rejected before any loading stream starts.
+	zero := 0
 	conf := config.Config{
 		HealthCheckTimeout: 5,
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{QueueDepth: &zero},
+				},
+			},
+		},
 		Models: map[string]config.ModelConfig{
 			"a": {ConcurrencyLimit: 2, SendLoadingState: &sendLoading},
 			"b": {},
@@ -725,5 +802,462 @@ func TestBaseRouter_Shutdown_StopsAllProcesses(t *testing.T) {
 	// Second Shutdown should report already in progress.
 	if err := b.Shutdown(0); err == nil {
 		t.Errorf("second Shutdown returned nil, want error")
+	}
+}
+
+// The TestFIFO_Priority_* tests below cover the request-level priority feature
+// (docs/design/request-priority.md §7). resolvePriority is an unexported
+// function of this package, so its branch-level cases live here (the session
+// that accepted this split: §14 note allows base_test.go while keeping the
+// TestFIFO_Priority_* naming so `-run TestFIFO_Priority` covers both). The
+// queue-level cases live in the scheduler package's fifo_test.go.
+
+// warnRec records resolvePriority warnOnce invocations: (raw value, target).
+type warnRec struct {
+	raws    []string
+	targets []int
+}
+
+func (w *warnRec) once(raw string, target int) {
+	w.raws = append(w.raws, raw)
+	w.targets = append(w.targets, target)
+}
+
+// priorityOnCfg is a feature-enabled FifoConfig matching the §5 example bands.
+func priorityOnCfg() config.FifoConfig {
+	return config.FifoConfig{
+		PriorityHeader:  "X-Request-Priority",
+		RequestPriority: map[string]int{"high": 100, "medium": 60, "low": 30},
+		DefaultPriority: 60,
+	}
+}
+
+// prioReq builds a request carrying the given X-Request-Priority values
+// (multiple add via repeated values).
+func prioReq(vals ...string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, v := range vals {
+		r.Header.Add("X-Request-Priority", v)
+	}
+	return r
+}
+
+// TestFIFO_Priority_HeaderMissing: no header sent → branch C ⇒ defaultPriority,
+// silent (warnOnce never invoked).
+func TestFIFO_Priority_HeaderMissing(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(httptest.NewRequest(http.MethodGet, "/", nil), priorityOnCfg(), w.once); got != 60 {
+		t.Fatalf("resolvePriority=%d want 60 (default)", got)
+	}
+	if len(w.raws) != 0 {
+		t.Errorf("warnOnce called %d times for absent header, want 0 (branch C is silent)", len(w.raws))
+	}
+}
+
+// TestFIFO_Priority_HeaderBlank: `X-Request-Priority: "  "` → branch B′ ⇒
+// warning (deduped by raw) + defaultPriority.
+func TestFIFO_Priority_HeaderBlank(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(prioReq("   "), priorityOnCfg(), w.once); got != 60 {
+		t.Fatalf("resolvePriority=%d want 60 (default)", got)
+	}
+	if len(w.raws) != 1 || w.raws[0] != "" {
+		t.Fatalf("warnOnce calls=%v want one blank raw", w.raws)
+	}
+	if len(w.targets) != 1 || w.targets[0] != 60 {
+		t.Fatalf("warnOnce targets=%v want [60]", w.targets)
+	}
+}
+
+// TestFIFO_Priority_HeaderUnknown: `"whale"` → branch B ⇒ warning (raw +
+// target) + defaultPriority.
+func TestFIFO_Priority_HeaderUnknown(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(prioReq("whale"), priorityOnCfg(), w.once); got != 60 {
+		t.Fatalf("resolvePriority=%d want 60 (default)", got)
+	}
+	if len(w.raws) != 1 || w.raws[0] != "whale" {
+		t.Fatalf("warnOnce calls=%v want [whale]", w.raws)
+	}
+	if len(w.targets) != 1 || w.targets[0] != 60 {
+		t.Fatalf("warnOnce targets=%v want [60]", w.targets)
+	}
+}
+
+// TestFIFO_Priority_HeaderCaseInsensitive: `"HiGh"` → branch A via lowercase
+// lookup ⇒ 100.
+func TestFIFO_Priority_HeaderCaseInsensitive(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(prioReq("HiGh"), priorityOnCfg(), w.once); got != 100 {
+		t.Fatalf("resolvePriority=%d want 100 (case-insensitive match)", got)
+	}
+	if len(w.raws) != 0 {
+		t.Errorf("warnOnce called %d times, want 0 for a known band", len(w.raws))
+	}
+}
+
+// TestFIFO_Priority_HeaderTrimmed: `" high "` → branch A after TrimSpace ⇒ 100.
+func TestFIFO_Priority_HeaderTrimmed(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(prioReq(" high "), priorityOnCfg(), w.once); got != 100 {
+		t.Fatalf("resolvePriority=%d want 100 (trimmed match)", got)
+	}
+	if len(w.raws) != 0 {
+		t.Errorf("warnOnce called %d times, want 0 for a known band", len(w.raws))
+	}
+}
+
+// TestFIFO_Priority_MultiHeaderFirstWins: two same-name headers, only the first
+// value is examined (D13).
+func TestFIFO_Priority_MultiHeaderFirstWins(t *testing.T) {
+	w := &warnRec{}
+	if got := resolvePriority(prioReq("low", "high"), priorityOnCfg(), w.once); got != 30 {
+		t.Fatalf("resolvePriority=%d want 30 (first value wins)", got)
+	}
+	if len(w.raws) != 0 {
+		t.Errorf("warnOnce called %d times, want 0 (first value is a known band)", len(w.raws))
+	}
+}
+
+// TestFIFO_Priority_DisabledEmptyMap: requestPriority empty ⇒ feature off —
+// the header is never read, every request resolves to defaultPriority, and no
+// warnOnce/log line is emitted even for an unknown value.
+func TestFIFO_Priority_DisabledEmptyMap(t *testing.T) {
+	cfg := config.FifoConfig{
+		PriorityHeader:  "X-Request-Priority",
+		RequestPriority: nil, // feature off
+		DefaultPriority: 60,
+	}
+	w := &warnRec{}
+	if got := resolvePriority(prioReq("whale"), cfg, w.once); got != 60 {
+		t.Fatalf("resolvePriority=%d want 60 (feature off)", got)
+	}
+	if len(w.raws) != 0 {
+		t.Errorf("warnOnce called %d times, want 0 when feature is off (no parsing logs)", len(w.raws))
+	}
+}
+
+// captureScheduler implements scheduler.Scheduler, capturing the HandlerReq it
+// receives so tests can read the resolved Priority, and answering admission so
+// ServeHTTP proceeds. It never grants: callers must cancel the request context
+// to unblock ServeHTTP.
+type captureScheduler struct {
+	got chan scheduler.HandlerReq
+}
+
+func (s *captureScheduler) OnRequest(req scheduler.HandlerReq) {
+	s.got <- req
+	req.Admit <- nil
+}
+func (s *captureScheduler) OnCancel(scheduler.HandlerReq)        {}
+func (s *captureScheduler) OnSwapDone(scheduler.SwapDone)        {}
+func (s *captureScheduler) OnServeDone(scheduler.ServeDoneEvent) {}
+func (s *captureScheduler) OnUnload([]string, time.Duration)     {}
+func (s *captureScheduler) OnShutdown(error)                     {}
+
+// TestFIFO_Priority_ZeroNormalized drives the real ServeHTTP path with a
+// synthetic config whose band maps to 0 (rejected by real config loading, see
+// TestConfig_RequestPriority_Validation): resolution leaks 0 and the single
+// normalization write point must rewrite it to defaultPriority before the
+// scheduler ever sees it.
+func TestFIFO_Priority_ZeroNormalized(t *testing.T) {
+	conf := config.Config{
+		HealthCheckTimeout: 5,
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{
+						PriorityHeader:  "X-Request-Priority",
+						RequestPriority: map[string]int{"high": 0, "medium": 60},
+						DefaultPriority: 60,
+					},
+				},
+			},
+		},
+	}
+	b := newTestBaseWithConfig(t, conf, nil, &stubPlanner{})
+	cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+	b.schedule = cap
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := newRequest("a").WithContext(ctx)
+	r.Header.Set("X-Request-Priority", "high") // maps to 0 in the synthetic config
+
+	serveDone := make(chan struct{})
+	go func() {
+		b.ServeHTTP(httptest.NewRecorder(), r)
+		close(serveDone)
+	}()
+
+	select {
+	case req := <-cap.got:
+		if req.Priority != 60 {
+			t.Fatalf("scheduler received Priority=%d, want 60 (0 normalized to default)", req.Priority)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler never received the request")
+	}
+
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("ServeHTTP did not return after context cancel")
+	}
+}
+
+// lockedBuffer is a goroutine-safe bytes.Buffer for capturing logger output.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+// TestFIFO_Priority_WarningDedup verifies warnPriorityMiss degrades repeat
+// occurrences of a raw header value from WARN (first time, carrying raw +
+// fallback target) to DEBUG (§7/D8).
+func TestFIFO_Priority_WarningDedup(t *testing.T) {
+	buf := &lockedBuffer{}
+	logger := logmon.NewWriter(buf)
+	logger.SetLogLevel(logmon.LevelDebug)
+	b, err := newBaseRouter("test", config.Config{}, nil, logger, &stubPlanner{})
+	if err != nil {
+		t.Fatalf("newBaseRouter: %v", err)
+	}
+
+	b.warnPriorityMiss("whale", 60)
+	b.warnPriorityMiss("whale", 60)
+	b.warnPriorityMiss("", 60)
+	b.warnPriorityMiss("", 60)
+
+	out := buf.String()
+	if want := 2; strings.Count(out, "[WARN]") != want {
+		t.Fatalf("WARN lines=%d want %d (first occurrence per raw):\n%s", strings.Count(out, "[WARN]"), want, out)
+	}
+	if !strings.Contains(out, "whale") || !strings.Contains(out, "60") {
+		t.Fatalf("warning must include raw and fallback target:\n%s", out)
+	}
+	if want := 2; strings.Count(out, "[DEBUG]") != want {
+		t.Fatalf("DEBUG lines=%d want %d (repeat occurrences):\n%s", strings.Count(out, "[DEBUG]"), want, out)
+	}
+}
+
+// TestBaseRouter_IngressHeaderSnapshot drives the real ServeHTTP path and
+// asserts the six ingress request headers land in ReqContextData.Metadata
+// under their snake_case keys. It covers the full matrix requested by the
+// feature: all six headers present (with the X-Forwarded-For proxy chain kept
+// whole), no headers present, a subset, and headers whose value is empty.
+// Missing/empty headers must leave no metadata key behind.
+func TestBaseRouter_IngressHeaderSnapshot(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    map[string]string // metadata key → value; absent key means "not present"
+	}{
+		{
+			name: "all six headers snapshotted verbatim",
+			headers: map[string]string{
+				"User-Agent":         "llama-bot/1.0",
+				"X-Forwarded-For":    "203.0.113.9, 198.51.100.2",
+				"X-Forwarded-Host":   "api.example.com",
+				"X-Forwarded-Proto":  "https",
+				"X-Real-Ip":          "203.0.113.9",
+				"X-Request-Priority": "high",
+			},
+			want: map[string]string{
+				"user_agent":         "llama-bot/1.0",
+				"x_forwarded_for":    "203.0.113.9, 198.51.100.2", // full chain, not first hop
+				"x_forwarded_host":   "api.example.com",
+				"x_forwarded_proto":  "https",
+				"x_real_ip":          "203.0.113.9",
+				"x_request_priority": "high",
+			},
+		},
+		{
+			name:    "no headers write no keys",
+			headers: nil,
+			want:    map[string]string{},
+		},
+		{
+			name: "missing headers leave no key",
+			headers: map[string]string{
+				"User-Agent": "curl/8.0",
+				"X-Real-Ip":  "198.51.100.7",
+			},
+			want: map[string]string{
+				"user_agent": "curl/8.0",
+				"x_real_ip":  "198.51.100.7",
+			},
+		},
+		{
+			name: "empty header value writes no key",
+			headers: map[string]string{
+				"X-Forwarded-For":    "",
+				"X-Request-Priority": "",
+			},
+			want: map[string]string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := config.Config{HealthCheckTimeout: 5, Audit: config.AuditConfig{RequestHeaders: true}}
+			b := newTestBaseWithConfig(t, conf, nil, &stubPlanner{})
+			cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+			b.schedule = cap
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := newRequest("a").WithContext(ctx)
+			for name, value := range tc.headers {
+				r.Header.Set(name, value)
+			}
+
+			serveDone := make(chan struct{})
+			go func() {
+				b.ServeHTTP(httptest.NewRecorder(), r)
+				close(serveDone)
+			}()
+
+			var req scheduler.HandlerReq
+			select {
+			case req = <-cap.got:
+			case <-time.After(2 * time.Second):
+				t.Fatal("scheduler never received the request")
+			}
+
+			data, ok := swaputil.ReadContext(req.Ctx)
+			if !ok {
+				t.Fatal("request context data missing")
+			}
+			for _, h := range ingressHeaderSnapshots {
+				want, wantPresent := tc.want[h.key]
+				got, gotPresent := data.Metadata[h.key]
+				switch {
+				case !wantPresent && gotPresent:
+					t.Errorf("metadata[%q]=%q, want no key", h.key, got)
+				case wantPresent && !gotPresent:
+					t.Errorf("metadata[%q] missing, want %q", h.key, want)
+				case wantPresent && got != want:
+					t.Errorf("metadata[%q]=%q, want %q", h.key, got, want)
+				}
+			}
+
+			cancel()
+			select {
+			case <-serveDone:
+			case <-time.After(time.Second):
+				t.Fatal("ServeHTTP did not return after context cancel")
+			}
+		})
+	}
+}
+
+// TestBaseRouter_IngressHeaderSnapshot_MultiLineXFF covers HTTP/1.1's
+// multi-line delivery of the same header name for X-Forwarded-For, which some
+// proxies emit. Header.Get alone would silently keep only the first line and
+// drop later hops — this test pins the join behavior: every line is kept, in
+// order, joined by ", " (probed: Header.Get returns "10.0.0.1, 10.0.0.2" here,
+// so the old first-line-only implementation would fail this assertion).
+func TestBaseRouter_IngressHeaderSnapshot_MultiLineXFF(t *testing.T) {
+	conf := config.Config{HealthCheckTimeout: 5, Audit: config.AuditConfig{RequestHeaders: true}}
+	b := newTestBaseWithConfig(t, conf, nil, &stubPlanner{})
+	cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+	b.schedule = cap
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := newRequest("a").WithContext(ctx)
+	r.Header.Add("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	r.Header.Add("X-Forwarded-For", "172.16.0.1")
+
+	serveDone := make(chan struct{})
+	go func() {
+		b.ServeHTTP(httptest.NewRecorder(), r)
+		close(serveDone)
+	}()
+
+	var req scheduler.HandlerReq
+	select {
+	case req = <-cap.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler never received the request")
+	}
+
+	data, ok := swaputil.ReadContext(req.Ctx)
+	if !ok {
+		t.Fatal("request context data missing")
+	}
+	if got := data.Metadata["x_forwarded_for"]; got != "10.0.0.1, 10.0.0.2, 172.16.0.1" {
+		t.Errorf("x_forwarded_for=%q, want %q (full multi-line chain)", got, "10.0.0.1, 10.0.0.2, 172.16.0.1")
+	}
+
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("ServeHTTP did not return after context cancel")
+	}
+}
+
+// TestBaseRouter_IngressHeaderSnapshot_Disabled pins the audit.requestHeaders
+// default (off): with the default config (switch unset) ServeHTTP must not run
+// the ingress header snapshot, so none of the six snake_case keys appear in the
+// request metadata even when every header is present.
+func TestBaseRouter_IngressHeaderSnapshot_Disabled(t *testing.T) {
+	b := newTestBase(t, nil, &stubPlanner{})
+	cap := &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
+	b.schedule = cap
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := newRequest("a").WithContext(ctx)
+	r.Header.Set("User-Agent", "llama-bot/1.0")
+	r.Header.Set("X-Forwarded-For", "203.0.113.9, 198.51.100.2")
+	r.Header.Set("X-Forwarded-Host", "api.example.com")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	r.Header.Set("X-Real-Ip", "203.0.113.9")
+	r.Header.Set("X-Request-Priority", "high")
+
+	serveDone := make(chan struct{})
+	go func() {
+		b.ServeHTTP(httptest.NewRecorder(), r)
+		close(serveDone)
+	}()
+
+	var req scheduler.HandlerReq
+	select {
+	case req = <-cap.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler never received the request")
+	}
+
+	data, ok := swaputil.ReadContext(req.Ctx)
+	if !ok {
+		t.Fatal("request context data missing")
+	}
+	for _, h := range ingressHeaderSnapshots {
+		if got, present := data.Metadata[h.key]; present {
+			t.Errorf("metadata[%q]=%q present with audit.requestHeaders disabled, want no key", h.key, got)
+		}
+	}
+
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("ServeHTTP did not return after context cancel")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,10 @@ type unloadReq struct {
 	targets []string
 	timeout time.Duration
 	respond chan struct{}
+}
+
+type queueSnapReq struct {
+	respond chan []QueueInfo
 }
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
@@ -57,6 +62,7 @@ type baseRouter struct {
 	cancelCh    chan scheduler.HandlerReq
 	shutdownCh  chan shutdownReq
 	unloadCh    chan unloadReq
+	queueSnapCh chan queueSnapReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
 
@@ -68,6 +74,12 @@ type baseRouter struct {
 	// events are intentionally NOT signalled here so test event counts
 	// remain stable.
 	testProcessed chan struct{}
+
+	// priorityWarned dedupes resolvePriority's branch B/B' warnings by raw
+	// header value: the first occurrence of a raw warns, later identical ones
+	// degrade to debug. sync.Map keeps the hot path lock-free (docs/
+	// design/request-priority.md §7).
+	priorityWarned sync.Map
 }
 
 func newBaseRouter(
@@ -92,6 +104,7 @@ func newBaseRouter(
 		cancelCh:    make(chan scheduler.HandlerReq),
 		shutdownCh:  make(chan shutdownReq),
 		unloadCh:    make(chan unloadReq),
+		queueSnapCh: make(chan queueSnapReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
@@ -132,6 +145,9 @@ func (b *baseRouter) run() {
 			close(req.respond)
 			b.notifyProcessed()
 
+		case req := <-b.queueSnapCh:
+			b.handleQueueSnapshot(req)
+
 		case ev := <-b.swapDoneCh:
 			b.schedule.OnSwapDone(ev)
 			b.notifyProcessed()
@@ -139,6 +155,50 @@ func (b *baseRouter) run() {
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
 		}
+	}
+}
+
+// handleQueueSnapshot answers a QueueSnapshot request on the run loop by
+// asking the scheduler for its queue, when the scheduler exposes one.
+func (b *baseRouter) handleQueueSnapshot(req queueSnapReq) {
+	snapshot, ok := b.schedule.(queueSnapshotProvider)
+	if !ok {
+		req.respond <- nil
+		return
+	}
+	queued := snapshot.Queued()
+	if len(queued) == 0 {
+		req.respond <- nil
+		return
+	}
+	out := make([]QueueInfo, 0, len(queued))
+	for _, q := range queued {
+		out = append(out, QueueInfo{
+			RequestID:     q.RequestID,
+			Model:         q.Model,
+			QueuePosition: q.QueuePosition,
+		})
+	}
+	req.respond <- out
+}
+
+// QueueSnapshot returns the scheduler queue's current contents: one entry per
+// queued request, in service order with 1-indexed positions, or nil when the
+// scheduler does not expose its queue. The read funnels through the run loop
+// (see sendUnload) so it observes scheduler state atomically with scheduling
+// events.
+func (b *baseRouter) QueueSnapshot() []QueueInfo {
+	req := queueSnapReq{respond: make(chan []QueueInfo, 1)}
+	select {
+	case b.queueSnapCh <- req:
+	case <-b.runDone:
+		return nil
+	}
+	select {
+	case out := <-req.respond:
+		return out
+	case <-b.runDone:
+		return nil
 	}
 }
 
@@ -474,6 +534,16 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Snapshot the ingress request headers into the request metadata before
+	// any dispatch decision: ServeHTTP is the one place that sees both the
+	// raw *http.Request and the context's metadata map. The captured values
+	// ride along with fifo_priority/priority into the activity record.
+	// Opt-in via audit.requestHeaders (default off); when disabled no
+	// snapshot keys are written and the audit feature has no effect.
+	if b.config.Audit.RequestHeaders {
+		snapshotIngressHeaders(req.Context(), req)
+	}
+
 	// Ignored websocket connections are deliberately kept outside the
 	// scheduler: they cannot start or queue a model, consume concurrency, or
 	// prevent another request from swapping the process out. A process may stop
@@ -494,6 +564,15 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Resolve the request-level priority once at ingress (docs/design/
+	// request-priority.md §7). The single normalization point below guarantees
+	// the legacy 0 sentinel never reaches the scheduler.
+	fifoCfg := b.config.Routing.Scheduler.Settings.Fifo
+	p := resolvePriority(req, fifoCfg, b.warnPriorityMiss)
+	if p == 0 { // single normalization point
+		p = fifoCfg.DefaultPriority
+	}
+
 	hr := scheduler.HandlerReq{
 		Model: data.ModelID,
 		Ctx:   req.Context(),
@@ -503,6 +582,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
+		Priority:   p,
 	}
 
 	select {
@@ -617,4 +697,69 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	resp.HandleFunc(w, req)
+}
+
+// ingressHeaderSnapshots is the header→metadata-key mapping stamped at
+// ingress. Keys use the snake_case style of the existing metadata bag
+// (fifo_priority, priority, selector). X-Request-Priority's snapshot matches
+// resolvePriority: the first value of the header, absent header ⇒ no key.
+// X-Forwarded-For is the one multi-value header: HTTP/1.1 may transmit it on
+// several same-name lines, so every line must be joined into the snapshot to
+// keep the full proxy chain (see the join flag).
+var ingressHeaderSnapshots = []struct {
+	header string
+	key    string
+	// join reads every header line and concatenates it with ", " instead of
+	// taking only the first (Header.Get). Only X-Forwarded-For needs it:
+	// multi-line same-name delivery is legal for it and dropping later hops
+	// would lose audit evidence.
+	join bool
+}{
+	{"User-Agent", "user_agent", false},
+	{"X-Forwarded-For", "x_forwarded_for", true},
+	{"X-Forwarded-Host", "x_forwarded_host", false},
+	{"X-Forwarded-Proto", "x_forwarded_proto", false},
+	{"X-Real-Ip", "x_real_ip", false},
+	{"X-Request-Priority", "x_request_priority", false},
+}
+
+// snapshotIngressHeaders copies the raw ingress request headers into the
+// request context's metadata map. Values are recorded verbatim as transmitted:
+// a single-line X-Forwarded-For comma chain stays intact, and a multi-line
+// X-Forwarded-For (HTTP/1.1 allows the same name repeated) is joined line by
+// line with ", " so no hop is dropped. X-Forwarded-For and X-Real-Ip are
+// forgeable proxy-chain values and must not be treated as a trusted client
+// identity; they are captured for auditing. A missing or empty header writes
+// no key, matching the "absent ⇒ no key" convention of the existing metadata.
+func snapshotIngressHeaders(ctx context.Context, r *http.Request) {
+	for _, h := range ingressHeaderSnapshots {
+		v := r.Header.Get(h.header)
+		if h.join {
+			v = strings.Join(r.Header.Values(h.header), ", ")
+		}
+		if v != "" {
+			_ = swaputil.SetReqData(ctx, h.key, v)
+		}
+	}
+}
+
+// resolvePriority is the baseRouter adapter for ResolveRequestPriority: it
+// reads the configured header off the request and wires in the router's
+// deduped warning callback. See ResolveRequestPriority for the §7 fallback
+// chain (docs/design/request-priority.md); the caller (ServeHTTP) owns the
+// single 0→defaultPriority normalization point (D12).
+func resolvePriority(r *http.Request, cfg config.FifoConfig, warnOnce func(raw string, target int)) int {
+	return ResolveRequestPriority(r.Header.Values(cfg.PriorityHeader), cfg.RequestPriority, cfg.DefaultPriority, warnOnce)
+}
+
+// warnPriorityMiss is the warnOnce implementation passed to resolvePriority.
+// Warnings are deduped by raw header value (§7/D8): the first occurrence of a
+// raw warns (message carries the raw value and the fallback target), later
+// identical raws degrade to debug.
+func (b *baseRouter) warnPriorityMiss(raw string, target int) {
+	if _, seen := b.priorityWarned.LoadOrStore(raw, struct{}{}); seen {
+		b.logger.Debugf("%s: X-Request-Priority header value %q previously reported; using default priority %d", b.name, raw, target)
+		return
+	}
+	b.logger.Warnf("%s: X-Request-Priority header value %q is not a recognized band; using default priority %d", b.name, raw, target)
 }

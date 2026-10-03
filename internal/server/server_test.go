@@ -66,6 +66,7 @@ func (s *stubRouter) RunningStatus() map[string]process.Status {
 	}
 	return out
 }
+func (s *stubRouter) QueueSnapshot() []router.QueueInfo { return nil }
 func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
 	s.unloadCalls.Add(1)
 	s.unloadTimeout = timeout

@@ -168,6 +168,7 @@ var modelPostJSONRoutes = []string{
 var modelPostFormRoutes = []string{
 	"/v1/audio/transcriptions",
 	"/v1/images/edits",
+	"/v1/images/variations",
 }
 
 // modelGetRoutes are model-dispatched GET endpoints (the model arrives as a
@@ -234,10 +235,12 @@ func New(cfg config.Config, logs *logmon.Group, perfMon *perf.Monitor, st store.
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:           cfg,
-		logs:          logs,
-		perf:          perfMon,
-		inflight:      newInflightTracker(),
+		cfg:  cfg,
+		logs: logs,
+		perf: perfMon,
+		inflight: newInflightTrackerWithQueueSnapshot(func() []router.QueueInfo {
+			return local.QueueSnapshot()
+		}),
 		metrics:       newMetricsMonitor(logs.ProxyLogs, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
 		store:         st,
 		build:         build,

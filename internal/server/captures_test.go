@@ -81,6 +81,9 @@ func TestServer_CaptureFieldsFor(t *testing.T) {
 	if got := captureFieldsFor("/v1/audio/speech"); got != captureReqAll|captureRespHeaders {
 		t.Fatalf("/v1/audio/speech = %b", got)
 	}
+	if got := captureFieldsFor("/v1/images/variations"); got != captureReqHeaders|captureRespHeaders {
+		t.Fatalf("/v1/images/variations = %b", got)
+	}
 }
 
 // jsonBody builds an embeddings-style JSON body of roughly n bytes.

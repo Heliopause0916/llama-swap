@@ -155,6 +155,16 @@ type UIActivityConfig struct {
 	SessionID []string `yaml:"session_id" json:"session_id"`
 }
 
+// AuditConfig controls optional request audit snapshots recorded into the
+// activity log metadata.
+type AuditConfig struct {
+	// RequestHeaders enables snapshotting the six ingress request headers
+	// (User-Agent, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto,
+	// X-Real-Ip, X-Request-Priority) into the activity record metadata under
+	// their snake_case keys. Optional, default false (disabled).
+	RequestHeaders bool `yaml:"requestHeaders" json:"requestHeaders"`
+}
+
 // ProfileConfig describes a runtime-selectable set of model ID rewrites.
 // Empty pin targets disable the corresponding model ID while the profile is
 // active. YAML null values decode to the same empty string representation.
@@ -182,6 +192,7 @@ type Config struct {
 	Tailcat            *TailcatConfig    `yaml:"tailcat"`
 	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
 	LogRequests        bool              `yaml:"logRequests"`
+	Audit              AuditConfig       `yaml:"audit"`
 	LogLevel           string            `yaml:"logLevel"`
 	LogTimeFormat      string            `yaml:"logTimeFormat"`
 	LogToStdout        string            `yaml:"logToStdout"`
@@ -274,7 +285,45 @@ type SchedulerSettings struct {
 }
 
 type FifoConfig struct {
-	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// PriorityHeader is the header name read once at ingress to resolve a
+	// request's priority band (docs/design/request-priority.md §6). When
+	// multiple same-name values are present the first wins. Defaults to
+	// X-Request-Priority.
+	PriorityHeader string `yaml:"priorityHeader"`
+
+	// RequestPriority maps a band word (normalized to lowercase at load) to
+	// its numeric priority value. Empty (absent or {}) disables request-level
+	// priority entirely: the header is never read and every request resolves
+	// to DefaultPriority. Values must be > 0 and unique across bands.
+	RequestPriority map[string]int `yaml:"requestPriority"`
+
+	// DefaultPriority is the fallback band used when the header is absent,
+	// blank, or unknown. When requestPriority is enabled it must equal one of
+	// the declared band values (no orphan defaults). Defaults to 60.
+	DefaultPriority int `yaml:"defaultPriority"`
+
+	// PATCH(v255): queueing for over-limit requests
+	// QueueDepth is the number of requests that may wait in the queue while a
+	// model is at its concurrency limit. nil means the default of 10; 0
+	// disables queueing entirely and over-limit requests are rejected with 429
+	// as before. The queue depth is a single global value applied to each
+	// model's own queue (capacity = concurrencyLimit + queueDepth per model).
+	QueueDepth *int `yaml:"queueDepth"`
+
+	// QueueTimeout is how long (in seconds) an over-limit request may wait in
+	// the queue before it is rejected with 429 + Retry-After. nil means the
+	// default of 60; 0 disables the timeout and waits indefinitely.
+	QueueTimeout *int `yaml:"queueTimeout"`
+
+	// L1.5: request-priority aging (docs/design/request-priority.md §17).
+	// PromoteAfter is how long (in seconds) an over-limit request may wait in
+	// the queue before it is pinned, at the next drain, to the
+	// scheduler-internal top tier (P_max = 2147483647) so it is serviced ahead
+	// of every newer arrival — a bounded-wait guarantee against starvation.
+	// nil or 0 disables the feature and leaves L1 drain behavior byte-for-byte
+	// unchanged. When enabled, the value must be smaller than the effective
+	// queueTimeout (D20), and every declared band value must stay below P_max.
+	PromoteAfter *int `yaml:"promoteAfter"`
 }
 
 type RouterConfig struct {

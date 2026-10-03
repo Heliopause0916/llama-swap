@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -111,6 +113,34 @@ store:
 `))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "store.path must not be empty")
+	})
+}
+
+func TestConfig_AuditRequestHeaders(t *testing.T) {
+	t.Run("default disabled when key absent", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+healthCheckTimeout: 15
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.Audit.RequestHeaders)
+	})
+
+	t.Run("enabled when audit.requestHeaders is true", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+audit:
+  requestHeaders: true
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.Audit.RequestHeaders)
+	})
+
+	t.Run("explicit false stays disabled", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+audit:
+  requestHeaders: false
+`))
+		require.NoError(t, err)
+		assert.False(t, cfg.Audit.RequestHeaders)
 	})
 }
 
@@ -1867,30 +1897,232 @@ routing:
 	assert.Contains(t, err.Error(), "unknown router")
 }
 
-func TestConfig_Routing_FifoPriorityUnknownModel(t *testing.T) {
-	yaml := twoModels + `
-routing:
-  scheduler:
-    settings:
-      fifo:
-        priority:
-          nope: 5
-`
-	_, err := LoadConfigFromReader(strings.NewReader(yaml))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unknown model")
+// fifoYAML returns a YAML document containing the given routing.scheduler
+// settings fifo block body (pre-indented at the fifo keys' depth).
+func fifoYAML(body string) string {
+	return "routing:\n  scheduler:\n    settings:\n      fifo:\n" + body
 }
 
-func TestConfig_Routing_FifoPriorityKnownModel(t *testing.T) {
-	yaml := twoModels + `
-routing:
-  scheduler:
-    settings:
-      fifo:
-        priority:
-          gemma: 5
-`
-	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
+// TestConfig_RequestPriority_Validation covers the §6 load-time checks of
+// docs/design/request-priority.md: an empty requestPriority is accepted
+// (feature off); once non-empty, keys must be non-empty after trimming and are
+// normalized to lowercase, values must be > 0 and unique, and defaultPriority
+// must equal one of the declared band values (D3/D6/D7).
+func TestConfig_RequestPriority_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string // substring of the load error; "" = must load
+	}{
+		{
+			name: "empty map accepts feature off",
+			body: "        requestPriority: {}\n",
+		},
+		{
+			name:    "defaultPriority outside bands",
+			body:    "        requestPriority: {high: 100, medium: 60, low: 30}\n        defaultPriority: 42\n",
+			wantErr: "defaultPriority",
+		},
+		{
+			name:    "band mapping to zero",
+			body:    "        requestPriority: {high: 100, medium: 60, batch: 0}\n        defaultPriority: 60\n",
+			wantErr: "must be > 0",
+		},
+		{
+			name:    "duplicate band values",
+			body:    "        requestPriority: {high: 60, medium: 60}\n        defaultPriority: 60\n",
+			wantErr: "must be unique",
+		},
+		{
+			name:    "blank band key",
+			body:    `        requestPriority: {" ": 10, high: 100, medium: 60}` + "\n        defaultPriority: 60\n",
+			wantErr: "empty after trimming",
+		},
+		{
+			name:    "normalized key collision",
+			body:    "        requestPriority: {HIGH: 100, high: 99, medium: 60}\n        defaultPriority: 60\n",
+			wantErr: "already declared",
+		},
+		{
+			name: "uppercase key normalizes to lowercase",
+			body: "        requestPriority: {HIGH: 100, medium: 60}\n        defaultPriority: 60\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(fifoYAML(tt.body)))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			fifo := cfg.Routing.Scheduler.Settings.Fifo
+			assert.Equal(t, "X-Request-Priority", fifo.PriorityHeader)
+			assert.Equal(t, 60, fifo.DefaultPriority)
+			if tt.name == "uppercase key normalizes to lowercase" {
+				assert.Equal(t, 100, fifo.RequestPriority["high"])
+				assert.Equal(t, 60, fifo.RequestPriority["medium"])
+				assert.NotContains(t, fifo.RequestPriority, "HIGH")
+			}
+		})
+	}
+}
+
+// TestConfig_RequestPriority_LegacyPriorityKeyAccepted verifies that a leftover
+// `priority:` key under routing.scheduler.settings.fifo is accepted for
+// upstream v255 compatibility: the config loads successfully and a one-time
+// deprecation warning (D14) points at the requestPriority migration, instead of
+// failing the load.
+func TestConfig_RequestPriority_LegacyPriorityKeyAccepted(t *testing.T) {
+	orig, buf := captureSlog(t)
+	defer slog.SetDefault(orig)
+
+	body := "        priority:\n          gemma: 5\n"
+	cfg, err := LoadConfigFromReader(strings.NewReader(fifoYAML(body)))
 	require.NoError(t, err)
-	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
+
+	out := buf.String()
+	assert.Contains(t, out, "deprecated")
+	assert.Contains(t, out, "routing.scheduler.settings.fifo.priority")
+	assert.Contains(t, out, "requestPriority") // points at the migration
+
+	// The key is ignored: requestPriority is untouched (nil => feature off)
+	// and the rest of the fifo block parses as usual.
+	fifo := cfg.Routing.Scheduler.Settings.Fifo
+	assert.Nil(t, fifo.RequestPriority)
+	assert.Equal(t, "X-Request-Priority", fifo.PriorityHeader)
+	assert.Equal(t, 60, fifo.DefaultPriority)
+}
+
+// TestConfig_UpstreamV255PriorityCompat loads the official v255-era example config
+// (internal/config/testdata/upstream-v255.example.yaml, extracted from the
+// pre-queueing fork tree at git 6384ea93~1). It still declares the legacy
+// model-level `priority:` key under routing.scheduler.settings.fifo. This fork
+// must accept that shape for upstream compatibility (D14): zero load errors,
+// the key ignored, and a one-time deprecation warning.
+func TestConfig_UpstreamV255PriorityCompat(t *testing.T) {
+	orig, buf := captureSlog(t)
+	defer slog.SetDefault(orig)
+
+	data, err := os.ReadFile("testdata/upstream-v255.example.yaml")
+	require.NoError(t, err)
+
+	cfg, err := LoadConfigFromReader(bytes.NewReader(data))
+	require.NoError(t, err)
+
+	fifo := cfg.Routing.Scheduler.Settings.Fifo
+	assert.Nil(t, fifo.RequestPriority)
+	assert.Equal(t, "X-Request-Priority", fifo.PriorityHeader)
+	assert.Equal(t, 60, fifo.DefaultPriority)
+
+	out := buf.String()
+	assert.Contains(t, out, "deprecated")
+	assert.Contains(t, out, "routing.scheduler.settings.fifo.priority")
+	assert.Contains(t, out, "requestPriority")
+}
+
+// captureSlog redirects the default slog logger into a buffer so the
+// load-time deprecation warning can be asserted, and returns the original
+// default logger plus the buffer. Use it in a defer as
+// `defer slog.SetDefault(orig)`. Tests in this package do not run in
+// parallel, so swapping the process-wide default logger is safe here.
+func captureSlog(t *testing.T) (*slog.Logger, *bytes.Buffer) {
+	t.Helper()
+	orig := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	return orig, &buf
+}
+
+// TestConfig_PromoteAfter_Validation covers the L1.5 §17.3 load-time checks of
+// routing.scheduler.settings.fifo.promoteAfter (docs/design/request-priority.md
+// §17.9): nil/0 disable the feature, a negative value fails the load, a
+// positive value must be smaller than the *effective* queueTimeout (D20 —
+// explicit or the 60s nil default), and — only while the feature is enabled —
+// every declared band value and defaultPriority must stay below the promoted
+// sentinel P_max = 2147483647 (D17). With promoteAfter off the L1 lenient band
+// range applies unchanged.
+func TestConfig_PromoteAfter_Validation(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantErr     string // substring of the load error; "" = must load
+		wantSeconds int    // expected PromoteAfter when set; -1 = must be nil
+	}{
+		{
+			name:        "negative value rejected",
+			body:        "        promoteAfter: -5\n",
+			wantErr:     "promoteAfter",
+			wantSeconds: -1,
+		},
+		{
+			name:        "nil accepted, feature off",
+			body:        "",
+			wantSeconds: -1,
+		},
+		{
+			name:        "zero accepted, feature off",
+			body:        "        promoteAfter: 0\n",
+			wantSeconds: 0,
+		},
+		{
+			name:        "30 seconds with explicit 60s timeout accepted",
+			body:        "        promoteAfter: 30\n        queueTimeout: 60\n",
+			wantSeconds: 30,
+		},
+		{
+			name:        "300 seconds with explicit 60s timeout rejected",
+			body:        "        promoteAfter: 300\n        queueTimeout: 60\n",
+			wantErr:     "promoteAfter",
+			wantSeconds: -1,
+		},
+		{
+			name:        "300 seconds with omitted timeout (effective 60s default) rejected",
+			body:        "        promoteAfter: 300\n",
+			wantErr:     "queueTimeout",
+			wantSeconds: -1,
+		},
+		{
+			name:        "infinite timeout pairs with any promoteAfter",
+			body:        "        promoteAfter: 300\n        queueTimeout: 0\n",
+			wantSeconds: 300,
+		},
+		{
+			name:        "band value at the promoted sentinel rejected while enabled",
+			body:        "        promoteAfter: 30\n        requestPriority: {high: 2147483648, medium: 60}\n        defaultPriority: 60\n",
+			wantErr:     "2147483647",
+			wantSeconds: -1,
+		},
+		{
+			name:        "empty requestPriority accepted with promoteAfter enabled (D21)",
+			body:        "        promoteAfter: 30\n        requestPriority: {}\n",
+			wantSeconds: 30,
+		},
+		{
+			name:        "band value at the sentinel accepted while feature off (L1 lenient range)",
+			body:        "        requestPriority: {high: 2147483648, medium: 60}\n        defaultPriority: 60\n",
+			wantSeconds: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadConfigFromReader(strings.NewReader(fifoYAML(tt.body)))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			fifo := cfg.Routing.Scheduler.Settings.Fifo
+			if tt.wantSeconds == -1 {
+				assert.Nil(t, fifo.PromoteAfter)
+			} else {
+				require.NotNil(t, fifo.PromoteAfter)
+				assert.Equal(t, tt.wantSeconds, *fifo.PromoteAfter)
+			}
+		})
+	}
 }

@@ -115,6 +115,14 @@ type HandlerReq struct {
 	Admit      chan error
 	Respond    chan HandlerResp
 	PositionCh chan int
+
+	// Priority is the request's effective request-level priority (> 0),
+	// resolved exactly once at ingress from the X-Request-Priority header (or
+	// the configured default). It is the FIFO queue sort key: higher values are
+	// serviced first, equal values keep arrival order. 0 never reaches the
+	// scheduler — ServeHTTP normalizes it to the default before constructing
+	// the request.
+	Priority int
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either
