@@ -102,7 +102,7 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 	}
 	switch use {
 	case "fifo":
-		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff), nil
+		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff, newGroupFuzzy(conf)), nil
 	default:
 		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
 	}
@@ -110,11 +110,16 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 
 // HandlerReq is one in-flight ServeHTTP request waiting for a routing decision.
 type HandlerReq struct {
-	Model      string
-	Ctx        context.Context
-	Admit      chan error
-	Respond    chan HandlerResp
-	PositionCh chan int
+	Model string
+	// RequestedModel records the model the client actually asked for when the
+	// fuzzy substitution rewrote Model to the group's online model. Empty when
+	// no rewrite happened. Display/metadata only — never used as a scheduling
+	// key.
+	RequestedModel string
+	Ctx            context.Context
+	Admit          chan error
+	Respond        chan HandlerResp
+	PositionCh     chan int
 
 	// Priority is the request's effective request-level priority (> 0),
 	// resolved exactly once at ingress from the X-Request-Priority header (or

@@ -3,8 +3,8 @@ title: Running several models at once with groups and matrix
 summary: Choosing between the group and matrix routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, concurrency, swap, vram]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix]
-updated: 2026-09-14
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.groups.*.fuzzy, routing.router.settings.groups.*.fuzzyIdleTimeout, routing.router.settings.matrix]
+updated: 2026-10-03
 ---
 
 # Running several models at once: groups and matrix
@@ -61,6 +61,59 @@ ID.
 
 The classic setup is one exclusive group for the big LLMs and one non-exclusive
 group for small always-useful models like embeddings and rerankers.
+
+## Fuzzy substitution (`fuzzy`)
+
+On a `swap: true` group, loading another member normally means a full model
+switch — up to minutes on large models. `fuzzy` trades strict model identity
+for availability: while the group is busy, or during an idle window after its
+last served request, a request for a *different* member is served by the
+currently online model instead of triggering a switch.
+
+```yaml
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        main:
+          swap: true
+          fuzzy: true
+          fuzzyIdleTimeout: 300
+          members: [llama, qwen]
+```
+
+How it decides:
+
+- The group is **busy** (any member is serving, queued, or the target of an
+  in-flight swap) → requests for another member are fuzzed onto the online
+  model.
+- The group is **idle** and it has served at least once within
+  `fuzzyIdleTimeout` seconds → still fuzzed onto the online model.
+- The group is **idle** and that window has expired, or it has never served a
+  request → a real switch happens as usual.
+
+`fuzzyIdleTimeout` is optional, default `300` seconds; `0` restricts fuzzy
+substitution to busy periods only. It requires `swap: true` — configuration
+fails to load otherwise (which also keeps spillover selectors, which require
+`swap: false` groups, incompatible by construction).
+
+Things worth knowing:
+
+- **The request body is not rewritten.** The upstream backend receives the
+  model name the client asked for. Backends that strictly validate the `model`
+  field need a matching `filters`/`useModelName` setup (or must tolerate the
+  original name).
+- **The Activity view shows the truth.** Fuzzed requests record
+  `served_model` in their metadata, rendered as the Served column of the
+  In-flight table and included in the activity record metadata. No key means
+  no substitution happened.
+- **Hot reloads reset the idle clock.** Rebuilding the server on a config
+  change loses the last-served timestamp, so the first request after a reload
+  may trigger one real switch.
+- Priority and queueing (`routing.scheduler.settings.fifo.*`) apply to the
+  rewritten target exactly as before; fuzzy only changes *which* model is
+  chosen, not how requests are ordered or admitted.
 
 ## `matrix` — more work, far more flexible
 

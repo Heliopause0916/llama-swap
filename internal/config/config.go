@@ -114,6 +114,18 @@ type GroupConfig struct {
 	Exclusive  bool     `yaml:"exclusive"`
 	Persistent bool     `yaml:"persistent"`
 	Members    []string `yaml:"members"`
+
+	// Fuzzy enables fuzzy substitution within a swap group: while the group is
+	// busy (or within FuzzyIdleTimeout after its last served request), requests
+	// for a different member are served by the currently online model without
+	// switching. Requires swap: true (validated at load).
+	Fuzzy bool `yaml:"fuzzy"`
+
+	// FuzzyIdleTimeout is the idle window in seconds during which an idle fuzzy
+	// group keeps serving new requests with its online model. nil → 300;
+	// 0 → fuzzy only while the group is busy. Negative values are rejected at
+	// load. Resolved by the scheduler at construction.
+	FuzzyIdleTimeout *int `yaml:"fuzzyIdleTimeout"`
 }
 
 // set default values for GroupConfig

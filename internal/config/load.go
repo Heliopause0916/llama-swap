@@ -248,6 +248,16 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				}
 				memberUsage[member] = groupID
 			}
+
+			// Fuzzy substitution is a swap-group feature: it only makes sense when
+			// the group holds a single online model. Reject the combination
+			// outright so a typo never silently disables real switching.
+			if groupConfig.Fuzzy && !groupConfig.Swap {
+				return Config{}, fmt.Errorf("group %s: fuzzy requires swap: true", groupID)
+			}
+			if t := groupConfig.FuzzyIdleTimeout; t != nil && *t < 0 {
+				return Config{}, fmt.Errorf("group %s: fuzzyIdleTimeout must be >= 0", groupID)
+			}
 		}
 	}
 

@@ -88,6 +88,14 @@ type FIFO struct {
 	// L1.5: request-priority aging (docs/design/request-priority.md §17)
 	promoteAfter time.Duration    // 0 = feature off (L1 drain behavior unchanged); > 0 = pin queue age >= this at the next drain
 	now          func() time.Time // injectable clock (D23); default time.Now, shared by deadline(), the aging check and the timeout prune
+
+	// Fuzzy substitution (swap groups): static per-group configuration
+	// resolved at construction, plus the runtime "last served" clock the idle
+	// window is measured against. lastServeDone entries are written only by
+	// OnServeDone; a missing entry means the group has never served and stays
+	// idle for fuzzy purposes.
+	fuzzy         groupFuzzy
+	lastServeDone map[string]time.Time
 }
 
 // QueuedInfo describes one request currently waiting in the scheduler queue.
@@ -129,7 +137,7 @@ func (s *FIFO) Queued() []QueuedInfo {
 // NewFIFO builds a FIFO scheduler. Per-model concurrency limits are derived
 // from models: each model's ConcurrencyLimit overrides defaultConcurrencyLimit
 // when set to a value greater than zero.
-func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
+func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects, fuzzy groupFuzzy) *FIFO {
 	limits := make(map[string]int, len(models))
 	for id, mc := range models {
 		limit := defaultConcurrencyLimit
@@ -174,6 +182,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		// L1.5: request-priority aging
 		promoteAfter: promoteAfter,
 		now:          time.Now,
+		// Fuzzy substitution
+		fuzzy:         fuzzy,
+		lastServeDone: make(map[string]time.Time),
 	}
 }
 
@@ -184,6 +195,10 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //
 // The decision tree, in order:
 //
+//  0. Fuzzy substitution — when the request's model belongs to a fuzzy swap
+//     group that is busy or within its idle window, rewrite the request's
+//     model to the group's online model (remembering the original in
+//     RequestedModel) so every later bookkeeping key stays consistent.
 //  1. Unknown model — respond with ErrModelNotFound and move on.
 //  2. A swap to the same model is already in flight — attach this waiter so
 //     one swap serves all callers that asked for the same model.
@@ -197,6 +212,10 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //  6. Otherwise — start a new swap. This may run in parallel with other active
 //     swaps when their evict sets don't intersect.
 func (s *FIFO) OnRequest(req HandlerReq) {
+	// (0) Fuzzy rewrite — before ALL bookkeeping, so admit/reserved/inFlight/
+	// queued/active keys all use the model that will actually serve.
+	req = s.fuzzySubstitute(req)
+
 	// (1) Unknown model.
 	state, ok := s.effects.ModelState(req.Model)
 	if !ok {
@@ -323,6 +342,12 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 // zero, retries the queue: requests whose swap was deferred because they would
 // have evicted this (now-idle) process can now proceed.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
+	// Fuzzy substitution: a completed serve restarts the group's idle window.
+	// Missing entries mean "never served", so they stay that way until a real
+	// grant completes.
+	if gid := s.memberOf(ev.ModelID); gid != "" {
+		s.lastServeDone[gid] = s.now()
+	}
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
 	// PATCH(v255): queueing for over-limit requests
@@ -413,6 +438,16 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
 	}
 
 	if s.effects.GrantServe(req, modelID) {
+		// Fuzzy substitution: record the model that will actually serve under
+		// served_model so the In-flight table's Served column (and the activity
+		// metadata) can show the substitution. Only written when a rewrite
+		// happened and the caller actually received the grant — a failed grant
+		// means the request was never served and must not leak the key.
+		if req.RequestedModel != "" && req.RequestedModel != modelID {
+			if err := swaputil.SetReqData(req.Ctx, "served_model", modelID); err != nil {
+				s.logger.Debugf("failed to set served_model metadata: %v", err)
+			}
+		}
 		s.inFlight[modelID]++
 	} else {
 		s.release(modelID)
@@ -800,4 +835,117 @@ func broadcastQueuePositions(queued []queuedItem) {
 			}
 		}
 	}
+}
+
+// fuzzySubstitute is OnRequest's step 0: when the request's model belongs to a
+// fuzzy swap group that is busy or within its idle window, the request is
+// rewritten to the group's online model instead of triggering a switch. The
+// original model is kept in RequestedModel for display/metadata only. Requests
+// outside fuzzy groups pass through unchanged.
+func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
+	gid, ok := s.fuzzy.groupOf[req.Model]
+	if !ok {
+		return req
+	}
+	served := s.fuzzyOnline(gid)
+	if served == "" || served == req.Model {
+		return req
+	}
+	if !s.fuzzyApplies(gid) {
+		return req
+	}
+	s.logger.Debugf("%s: fuzzy serving %s with online model %s (group %s)", s.name, req.Model, served, gid)
+	req.RequestedModel = req.Model
+	req.Model = served
+	return req
+}
+
+// fuzzyOnline returns the model an incoming request would be fuzzed onto: the
+// in-flight swap target first (the direction the group is already switching),
+// else a running group member — preferring a Ready one, then the
+// lexicographically first for determinism. Empty string when the group has
+// neither. A swap group holds at most one online member, but a stopping
+// sibling can transiently overlap with the next member, so candidates are
+// collected and sorted rather than assumed unique.
+func (s *FIFO) fuzzyOnline(gid string) string {
+	var targets []string
+	for target := range s.active {
+		if s.memberOf(target) == gid {
+			targets = append(targets, target)
+		}
+	}
+	if len(targets) > 0 {
+		sort.Strings(targets)
+		return targets[0]
+	}
+
+	var ready, others []string
+	for id, state := range s.effects.RunningModels() {
+		if s.memberOf(id) != gid {
+			continue
+		}
+		if state == process.StateReady {
+			ready = append(ready, id)
+		} else {
+			others = append(others, id)
+		}
+	}
+	sort.Strings(ready)
+	sort.Strings(others)
+	if len(ready) > 0 {
+		return ready[0]
+	}
+	if len(others) > 0 {
+		return others[0]
+	}
+	return ""
+}
+
+// fuzzyApplies reports whether a fuzzy rewrite may happen for the group right
+// now: while the group is busy, or — for a group that has served at least once
+// — within the idle window since its last completed serve. A group that never
+// served (e.g. only preloaded) stays idle, so its next request performs a real
+// switch.
+func (s *FIFO) fuzzyApplies(gid string) bool {
+	if s.groupBusy(gid) {
+		return true
+	}
+	t, ok := s.lastServeDone[gid]
+	if !ok {
+		return false
+	}
+	return s.now().Sub(t) < s.fuzzy.idleTimeout[gid]
+}
+
+// groupBusy reports whether any member of the group is serving, queued, or
+// targeted/evicted by an in-flight swap. Cost is O(|inFlight| + |queued| +
+// Σ|evict|) per fuzzy request — members per group are few, no caching needed.
+func (s *FIFO) groupBusy(gid string) bool {
+	for m, n := range s.inFlight {
+		if n > 0 && s.memberOf(m) == gid {
+			return true
+		}
+	}
+	for _, item := range s.queued {
+		if s.memberOf(item.Req.Model) == gid {
+			return true
+		}
+	}
+	for target, sw := range s.active {
+		if s.memberOf(target) == gid {
+			return true
+		}
+		for _, e := range sw.evict {
+			if s.memberOf(e) == gid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// memberOf returns the fuzzy group the model belongs to, or "" when the model
+// is not a member of any fuzzy group.
+func (s *FIFO) memberOf(m string) string {
+	return s.fuzzy.groupOf[m]
 }

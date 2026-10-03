@@ -107,6 +107,17 @@
                         "default": false,
                         "description": "Prevents other groups from unloading the models in this group. Does not affect individual model behaviour."
                     },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Fuzzy substitution: while the group is busy or within fuzzyIdleTimeout seconds after its last served request, requests for another member are served by the currently online model without switching. Requires swap: true."
+                    },
+                    "fuzzyIdleTimeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 300,
+                        "description": "Idle window (seconds) during which an idle fuzzy group keeps serving new requests with its online model. 0 restricts fuzzy substitution to busy periods."
+                    },
                     "members": {
                         "type": "array",
                         "items": {

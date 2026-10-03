@@ -12,6 +12,46 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestConfig_Fuzzy_FieldsParse verifies the fuzzy group fields parse with
+// their values on the routing.router path.
+func TestConfig_Fuzzy_FieldsParse(t *testing.T) {
+	content := `
+models:
+  m1:
+    cmd: echo m1
+    proxy: http://localhost:8080
+  m2:
+    cmd: echo m2
+    proxy: http://localhost:8081
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        g1:
+          fuzzy: true
+          fuzzyIdleTimeout: 120
+          members: [m1, m2]
+        g2:
+          members: []
+`
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	assert.NoError(t, err)
+
+	g1, exists := config.Groups["g1"]
+	assert.True(t, exists, "g1 should exist")
+	assert.True(t, g1.Fuzzy)
+	if assert.NotNil(t, g1.FuzzyIdleTimeout) {
+		assert.Equal(t, 120, *g1.FuzzyIdleTimeout)
+	}
+
+	// A group without the fields keeps the zero values.
+	g2, exists := config.Groups["g2"]
+	assert.True(t, exists, "g2 should exist")
+	assert.False(t, g2.Fuzzy)
+	assert.Nil(t, g2.FuzzyIdleTimeout)
+}
+
 func TestConfig_SanitizeCommand(t *testing.T) {
 	// Test a command with spaces and newlines
 	args, err := SanitizeCommand(`python model1.py \
@@ -69,6 +109,8 @@ models:
 		assert.Equal(t, true, defaultGroup.Swap)
 		assert.Equal(t, true, defaultGroup.Exclusive)
 		assert.Equal(t, false, defaultGroup.Persistent)
+		assert.Equal(t, false, defaultGroup.Fuzzy)
+		assert.Nil(t, defaultGroup.FuzzyIdleTimeout)
 		assert.Equal(t, []string{"model1"}, defaultGroup.Members)
 	}
 
@@ -149,6 +191,12 @@ groups:
     swap: true
     exclusive: false
     members: ["model2"]
+  fuzzy:
+    swap: true
+    fuzzy: true
+    fuzzyIdleTimeout: 120
+    members:
+      - "model3"
   forever:
     exclusive: false
     persistent: true
@@ -177,16 +225,27 @@ groups:
 		IdleConn:       90,
 	}
 
+	// A fuzzy group in the fixture covers the legacy top-level `groups:` parse
+	// path for the new fields.
+	fuzzyIdleTimeout := 120
+
 	expectedGroups := map[string]GroupConfig{
 		DEFAULT_GROUP_ID: {
 			Swap:      true,
 			Exclusive: true,
-			Members:   []string{"model1", "model3"},
+			Members:   []string{"model1"},
 		},
 		"group1": {
 			Swap:      true,
 			Exclusive: false,
 			Members:   []string{"model2"},
+		},
+		"fuzzy": {
+			Swap:             true,
+			Exclusive:        true,
+			Fuzzy:            true,
+			FuzzyIdleTimeout: &fuzzyIdleTimeout,
+			Members:          []string{"model3"},
 		},
 		"forever": {
 			Swap:       true,

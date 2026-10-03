@@ -192,6 +192,7 @@
       { id: "elapsed", label: "Elapsed", defaultVisible: true },
       { id: "stage", label: "Stage", defaultVisible: true },
       { id: "priority", label: "Priority", defaultVisible: true },
+      { id: "served", label: "Served", defaultVisible: true },
     ];
     if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
     cols.push(
@@ -768,6 +769,16 @@
                   {:else if columnId === "priority"}
                     {#if request.metadata?.priority}
                       <span class="font-mono text-xs tabular-nums">{request.metadata.priority}</span>
+                    {:else}
+                      <span class="text-muted-foreground">—</span>
+                    {/if}
+                  {:else if columnId === "served"}
+                    {#if request.metadata?.served_model}
+                      <MiddleEllipsis
+                        value={request.metadata.served_model}
+                        tailLength={10}
+                        className="max-w-[14rem] font-mono text-xs"
+                      />
                     {:else}
                       <span class="text-muted-foreground">—</span>
                     {/if}

@@ -1,0 +1,461 @@
+package scheduler
+
+// Tests for fuzzy substitution in swap groups (OnRequest step 0). All tests
+// drive the FIFO directly and synchronously like fifo_test.go, with a fake
+// clock so the idle-window decisions are deterministic.
+
+import (
+	"context"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+)
+
+// newFIFOFuzzy builds a FIFO with the fake clock wired in (same pattern as
+// newFIFOAging) plus the given fuzzy group snapshot.
+func newFIFOFuzzy(planner Swapper, eff Effects, models map[string]config.ModelConfig, fuzzy groupFuzzy) (*FIFO, *fakeClock) {
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff, fuzzy)
+	clock := newFakeClock()
+	s.now = clock.now
+	return s, clock
+}
+
+// fuzzyFor builds a groupFuzzy snapshot for one group: every named model is a
+// member, and the group gets the given idle window in seconds.
+func fuzzyFor(members []string, gid string, idleSecs int) groupFuzzy {
+	f := groupFuzzy{groupOf: map[string]string{}, idleTimeout: map[string]time.Duration{}}
+	for _, m := range members {
+		f.groupOf[m] = gid
+	}
+	f.idleTimeout[gid] = time.Duration(idleSecs) * time.Second
+	return f
+}
+
+// reqMeta creates a request whose context carries a ReqContextData with an
+// empty shared metadata map, matching what the server's middleware seeds, so
+// grantHandler's SetReqData writes are observable in tests.
+func reqMeta(model string) HandlerReq {
+	r := req(model)
+	r.Ctx = swaputil.SetContext(context.Background(), swaputil.ReqContextData{
+		Model:    model,
+		ModelID:  model,
+		Metadata: map[string]string{},
+	})
+	return r
+}
+
+// reqMetaCh is reqMeta plus a Respond channel so OnCancel can identify it.
+func reqMetaCh(model string) HandlerReq {
+	r := reqMeta(model)
+	r.Respond = make(chan HandlerResp, 1)
+	return r
+}
+
+// metaValue reads a metadata key written through the request's shared context.
+func metaValue(t *testing.T, r HandlerReq, key string) (string, bool) {
+	t.Helper()
+	data, ok := swaputil.ReadContext(r.Ctx)
+	if !ok {
+		return "", false
+	}
+	v, found := data.Metadata[key]
+	return v, found
+}
+
+func TestFIFO_Fuzzy_DisabledByDefault(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, groupFuzzy{})
+
+	r := req("b")
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch, no fuzzy groups configured)", eff.startsFor("b"))
+	}
+	if len(eff.grants) != 0 {
+		t.Fatalf("grants=%v want none", eff.grants)
+	}
+}
+
+func TestFIFO_Fuzzy_BusyServesWithRunningModel(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.inFlight["a"] = 1 // group busy
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.served("b") != 0 || eff.served("a") != 1 {
+		t.Fatalf("served b=%d a=%d want b=0 a=1", eff.served("b"), eff.served("a"))
+	}
+	if eff.lastServeReq.RequestedModel != "b" {
+		t.Fatalf("RequestedModel=%q want %q", eff.lastServeReq.RequestedModel, "b")
+	}
+	if v, ok := metaValue(t, r, "served_model"); !ok || v != "a" {
+		t.Fatalf("metadata served_model=%q (found=%v) want %q", v, ok, "a")
+	}
+}
+
+func TestFIFO_Fuzzy_BusyQueuedPendingRewrites(t *testing.T) {
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+	}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, models, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	// Two fast-path grants fill the model (reserved=2); a third "a" queues on
+	// capacity (reserved 3 > limit 2).
+	r1 := req("a")
+	s.OnRequest(r1)
+	r2 := req("a")
+	s.OnRequest(r2)
+	r3 := reqCh("a")
+	s.OnRequest(r3)
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1", len(s.queued))
+	}
+
+	// A fuzzy request arrives while the group is busy: rewritten to "a" and
+	// queued under "a"'s capacity rules.
+	r4 := reqMetaCh("b")
+	s.OnRequest(r4)
+	if len(s.queued) != 2 {
+		t.Fatalf("queued=%d want 2", len(s.queued))
+	}
+	for i, item := range s.queued {
+		if item.Req.Model != "a" {
+			t.Fatalf("queued[%d].Model=%q want %q", i, item.Req.Model, "a")
+		}
+	}
+	if got := s.queued[1].Req.RequestedModel; got != "b" {
+		t.Fatalf("queued[1].RequestedModel=%q want %q", got, "b")
+	}
+
+	// Cancelling the fuzzy waiter releases its reservation without panicking.
+	s.OnCancel(r4)
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1 after cancel", len(s.queued))
+	}
+	if s.reserved["a"] != 3 {
+		t.Fatalf("reserved[a]=%d want 3 after cancel", s.reserved["a"])
+	}
+}
+
+func TestFIFO_Fuzzy_ActiveSwapTargetWins(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStarting
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	s.active["b"] = &activeSwap{modelID: "b", evict: []string{"a"}}
+
+	r := reqMetaCh("c")
+	s.OnRequest(r)
+
+	// Rewritten onto the swap target and joined to its waiters.
+	if len(s.active["b"].waiters) != 1 {
+		t.Fatalf("waiters=%d want 1", len(s.active["b"].waiters))
+	}
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+
+	if eff.served("b") != 1 {
+		t.Fatalf("served b=%d want 1", eff.served("b"))
+	}
+	if eff.lastServeReq.RequestedModel != "c" {
+		t.Fatalf("RequestedModel=%q want %q", eff.lastServeReq.RequestedModel, "c")
+	}
+	if v, ok := metaValue(t, r, "served_model"); !ok || v != "b" {
+		t.Fatalf("served_model=%q (found=%v) want %q", v, ok, "b")
+	}
+}
+
+func TestFIFO_Fuzzy_IdleWithinWindowKeepsModel(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s, clock := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.lastServeDone["g"] = clock.now().Add(-10 * time.Second)
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.served("a") != 1 {
+		t.Fatalf("served a=%d want 1", eff.served("a"))
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+	if v, ok := metaValue(t, r, "served_model"); !ok || v != "a" {
+		t.Fatalf("served_model=%q (found=%v) want %q", v, ok, "a")
+	}
+}
+
+func TestFIFO_Fuzzy_IdlePastWindowSwitches(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, clock := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.lastServeDone["g"] = clock.now().Add(-301 * time.Second)
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1", eff.startsFor("b"))
+	}
+	if len(eff.grants) != 0 {
+		t.Fatalf("grants=%v want none", eff.grants)
+	}
+	if _, ok := metaValue(t, r, "served_model"); ok {
+		t.Fatal("served_model written for a real switch")
+	}
+}
+
+func TestFIFO_Fuzzy_NeverServedRealSwitch(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	r := req("b")
+	s.OnRequest(r)
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1", eff.startsFor("b"))
+	}
+	if len(eff.grants) != 0 {
+		t.Fatalf("grants=%v want none", eff.grants)
+	}
+}
+
+func TestFIFO_Fuzzy_ZeroTimeoutOnlyWhenBusy(t *testing.T) {
+	// Idle (never served): real switch.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 0))
+	r := req("b")
+	s.OnRequest(r)
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("idle: starts for b=%d want 1", eff.startsFor("b"))
+	}
+
+	// Busy: rewrite to the running model.
+	eff2 := newFakeEffects()
+	eff2.states["a"] = process.StateReady
+	s2, _ := newFIFOFuzzy(&stubPlanner{}, eff2, nil, fuzzyFor([]string{"a", "b"}, "g", 0))
+	s2.inFlight["a"] = 1
+	r2 := reqMeta("b")
+	s2.OnRequest(r2)
+	if eff2.served("a") != 1 {
+		t.Fatalf("busy: served a=%d want 1", eff2.served("a"))
+	}
+	if eff2.lastServeReq.RequestedModel != "b" {
+		t.Fatalf("busy: RequestedModel=%q want %q", eff2.lastServeReq.RequestedModel, "b")
+	}
+}
+
+func TestFIFO_Fuzzy_ServeDoneRefreshesWindow(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s, clock := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	// Serve "a" once: the grant does not open the window, only the completion
+	// does.
+	rA := req("a")
+	s.OnRequest(rA)
+	if eff.served("a") != 1 {
+		t.Fatalf("served a=%d want 1", eff.served("a"))
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+
+	// Long after that serve the idle group is outside the window.
+	clock.advance(310 * time.Second)
+	if s.fuzzyApplies("g") {
+		t.Fatal("fuzzyApplies=true want false after the window has passed")
+	}
+
+	// Serve "a" again: the completion stamps the exact refresh time.
+	rA2 := req("a")
+	s.OnRequest(rA2)
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	want, ok := s.lastServeDone["g"]
+	if !ok || !want.Equal(clock.now()) {
+		t.Fatalf("lastServeDone[g]=%v (found=%v) want %v", want, ok, clock.now())
+	}
+
+	// Inside the rebuilt window the next request is fuzzed onto "a".
+	clock.advance(290 * time.Second)
+	if !s.fuzzyApplies("g") {
+		t.Fatal("fuzzyApplies=false want true within the refreshed window")
+	}
+	rB := reqMeta("b")
+	s.OnRequest(rB)
+	if eff.served("a") != 3 {
+		t.Fatalf("served a=%d want 3", eff.served("a"))
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+}
+
+func TestFIFO_Fuzzy_CancelDoesNotRefresh(t *testing.T) {
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+	}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s, clock := newFIFOFuzzy(&stubPlanner{}, eff, models, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	// Two fast-path grants fill the 2-slot model; the third "a" queues.
+	r1 := req("a")
+	s.OnRequest(r1)
+	r2 := req("a")
+	s.OnRequest(r2)
+	r3 := reqCh("a")
+	s.OnRequest(r3)
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1", len(s.queued))
+	}
+
+	// The queued request is cancelled: it was never served, so the window
+	// must not be refreshed.
+	clock.advance(400 * time.Second)
+	s.OnCancel(r3)
+	if _, ok := s.lastServeDone["g"]; ok {
+		t.Fatal("lastServeDone[g] refreshed by a cancelled request")
+	}
+}
+
+func TestFIFO_Fuzzy_BookkeepingKeysUseRewrittenModel(t *testing.T) {
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+	}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, models, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	// Two fast-path grants fill the 2-slot model; both fuzzy requests queue.
+	rA := req("a")
+	s.OnRequest(rA)
+	rA2 := req("a")
+	s.OnRequest(rA2)
+	rB := reqMetaCh("b")
+	s.OnRequest(rB)
+	rC := reqMetaCh("b")
+	s.OnRequest(rC)
+	if len(s.queued) != 2 {
+		t.Fatalf("queued=%d want 2", len(s.queued))
+	}
+	if s.reserved["a"] != 4 {
+		t.Fatalf("reserved[a]=%d want 4", s.reserved["a"])
+	}
+
+	// Cancellations and completions unwind the rewritten key only.
+	s.OnCancel(rC)
+	s.OnCancel(rB)
+	if s.reserved["a"] != 2 {
+		t.Fatalf("reserved[a]=%d want 2 after cancels", s.reserved["a"])
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if _, ok := s.reserved["a"]; ok {
+		t.Fatalf("reserved[a]=%d want none after completions", s.reserved["a"])
+	}
+}
+
+func TestFIFO_Fuzzy_MultipleRunningPrefersReady(t *testing.T) {
+	// A non-Ready member running and a Ready member: the Ready one wins.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStarting
+	eff.states["b"] = process.StateReady
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	s.inFlight["a"] = 1 // busy
+
+	r := reqMeta("c")
+	s.OnRequest(r)
+	if v, ok := metaValue(t, r, "served_model"); !ok || v != "b" {
+		t.Fatalf("served_model=%q (found=%v) want %q (Ready preferred)", v, ok, "b")
+	}
+
+	// Both non-Ready: the lexicographically first member is chosen. The
+	// rewrite is observable in the swap the scheduler starts.
+	eff2 := newFakeEffects()
+	eff2.states["a"] = process.StateStarting
+	eff2.states["b"] = process.StateStarting
+	eff2.states["c"] = process.StateStopped
+	s2, _ := newFIFOFuzzy(&stubPlanner{}, eff2, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	s2.inFlight["a"] = 1
+
+	r2 := reqMeta("c")
+	s2.OnRequest(r2)
+	if eff2.startsFor("a") != 1 {
+		t.Fatalf("starts for a=%d want 1 (lexicographically first)", eff2.startsFor("a"))
+	}
+	sw, ok := s2.active["a"]
+	if !ok {
+		t.Fatal("rewritten request did not start a swap for the chosen model")
+	}
+	if got := sw.waiters[0].RequestedModel; got != "c" {
+		t.Fatalf("RequestedModel=%q want %q", got, "c")
+	}
+}
+
+func TestFIFO_Fuzzy_NonMemberUnaffected(t *testing.T) {
+	// Regression baseline: a model outside every fuzzy group behaves exactly
+	// as it did before the feature existed.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["c"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{evict: map[string][]string{"c": {"a"}}}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+
+	// Baseline fast-path grant for the fuzzy group member still works.
+	r2 := reqMeta("a")
+	s.OnRequest(r2)
+	if eff.served("a") != 1 {
+		t.Fatalf("served a=%d want 1", eff.served("a"))
+	}
+	if eff.lastServeReq.RequestedModel != "" {
+		t.Fatalf("RequestedModel=%q want empty", eff.lastServeReq.RequestedModel)
+	}
+	if _, ok := metaValue(t, r2, "served_model"); ok {
+		t.Fatal("served_model written for a non-fuzzy request")
+	}
+
+	// Finish serving, then a non-member request still performs a real switch.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	r := req("c")
+	s.OnRequest(r)
+	if eff.startsFor("c") != 1 {
+		t.Fatalf("starts for c=%d want 1", eff.startsFor("c"))
+	}
+}
+
+func TestFIFO_Fuzzy_GrantErrorNoMetadata(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.serveResult["a"] = false // the caller is gone by grant time
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b"}, "g", 300))
+	s.inFlight["a"] = 1 // busy
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.served("a") != 0 {
+		t.Fatalf("served a=%d want 0", eff.served("a"))
+	}
+	if s.reserved["a"] != 0 {
+		t.Fatalf("reserved[a]=%d want 0 after failed grant", s.reserved["a"])
+	}
+	if _, ok := metaValue(t, r, "served_model"); ok {
+		t.Fatal("served_model leaked on a failed grant")
+	}
+}

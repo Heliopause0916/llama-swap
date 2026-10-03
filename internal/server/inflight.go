@@ -80,6 +80,10 @@ type inflightRequest struct {
 	cancel      context.CancelFunc
 	lastEmitted time.Time
 	timer       *time.Timer
+	// ctx is the request context captured at Add. Its ReqContextData.Metadata
+	// map is shared, so keys written after the entry snapshot (e.g. the
+	// scheduler's served_model) remain readable here.
+	ctx context.Context
 }
 
 func newInflightTracker() *inflightTracker {
@@ -128,7 +132,7 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 	}
 
 	t.mu.Lock()
-	req := &inflightRequest{entry: entry, cancel: cancel, lastEmitted: time.Now()}
+	req := &inflightRequest{entry: entry, cancel: cancel, ctx: r.Context(), lastEmitted: time.Now()}
 	t.requests[id] = req
 	t.enqueueLocked(upsertInflightEvent(req.entry))
 	t.mu.Unlock()
@@ -242,6 +246,24 @@ func (t *inflightTracker) updateStages() bool {
 			req.entry.Stage = stage
 			req.entry.QueuePosition = pos
 			t.enqueueLocked(upsertInflightEvent(req.entry))
+			continue
+		}
+
+		// Fuzzy substitution (served_model) lands in the shared metadata map
+		// after Add snapshots the entry; surface it on the next tick so the
+		// UI Served column fills in without a new event channel. Only this
+		// key is synced so audit-header keys never trigger extra upserts.
+		// Entries seeded without a context (some tests) have nothing to read.
+		if req.ctx != nil {
+			if data, ok := swaputil.ReadContext(req.ctx); ok {
+				if v, found := data.Metadata["served_model"]; found && req.entry.Metadata["served_model"] != v {
+					if req.entry.Metadata == nil {
+						req.entry.Metadata = map[string]string{}
+					}
+					req.entry.Metadata["served_model"] = v
+					t.enqueueLocked(upsertInflightEvent(req.entry))
+				}
+			}
 		}
 	}
 	return true

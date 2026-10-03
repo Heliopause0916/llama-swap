@@ -674,6 +674,19 @@ routing:
           # - false: running a member leaves other groups untouched
           exclusive: true
 
+          # fuzzy: serve requests for a different member with the currently
+          # online model instead of switching, while the group is busy or
+          # within fuzzyIdleTimeout seconds of its last served request.
+          # - optional, default: false
+          # - requires swap: true (configuration fails to load otherwise)
+          # fuzzy: true
+
+          # fuzzyIdleTimeout: idle window in seconds during which an idle fuzzy
+          #   group keeps serving new requests with its online model
+          # - optional, default: 300
+          # - 0 restricts fuzzy substitution to busy periods
+          # fuzzyIdleTimeout: 300
+
           # members: the model IDs in this group
           # required
           members:

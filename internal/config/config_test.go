@@ -1897,6 +1897,87 @@ routing:
 	assert.Contains(t, err.Error(), "unknown router")
 }
 
+// TestLoad_FuzzyRequiresSwap verifies the load-time rule that the fuzzy group
+// option is only valid on swap groups, for both the routing.router block and
+// the legacy top-level `groups:` key (they converge on the same validation).
+func TestLoad_FuzzyRequiresSwap(t *testing.T) {
+	legacy := twoModels + `
+groups:
+  g1:
+    swap: false
+    fuzzy: true
+    members: [gemma, qwen]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(legacy))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group g1: fuzzy requires swap: true")
+
+	routing := twoModels + `
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        g1:
+          swap: false
+          fuzzy: true
+          members: [gemma, qwen]
+`
+	_, err = LoadConfigFromReader(strings.NewReader(routing))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group g1: fuzzy requires swap: true")
+}
+
+// TestLoad_FuzzyIdleTimeoutNegative verifies a negative fuzzyIdleTimeout is
+// rejected at load.
+func TestLoad_FuzzyIdleTimeoutNegative(t *testing.T) {
+	yaml := twoModels + `
+groups:
+  g1:
+    fuzzy: true
+    fuzzyIdleTimeout: -1
+    members: [gemma, qwen]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group g1: fuzzyIdleTimeout must be >= 0")
+}
+
+// TestLoad_FuzzyDefaultsPass verifies a fuzzy group with explicit defaults and
+// groups that do not mention the fuzzy fields at all both load cleanly, and
+// that unset fields parse to their zero values (fuzzy off, timeout nil).
+func TestLoad_FuzzyDefaultsPass(t *testing.T) {
+	yaml := twoModels + `
+groups:
+  g1:
+    fuzzy: true
+    fuzzyIdleTimeout: 0
+    members: [gemma, qwen]
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.NoError(t, err)
+	g1 := cfg.Groups["g1"]
+	assert.True(t, g1.Fuzzy)
+	if assert.NotNil(t, g1.FuzzyIdleTimeout) {
+		assert.Equal(t, 0, *g1.FuzzyIdleTimeout)
+	}
+
+	// A group without any fuzzy fields keeps the zero values, and the injected
+	// default group never sets them.
+	yaml = twoModels + `
+groups:
+  g1:
+    members: [gemma, qwen]
+`
+	cfg, err = LoadConfigFromReader(strings.NewReader(yaml))
+	require.NoError(t, err)
+	g1 = cfg.Groups["g1"]
+	assert.False(t, g1.Fuzzy)
+	assert.Nil(t, g1.FuzzyIdleTimeout)
+	assert.False(t, cfg.Groups[DEFAULT_GROUP_ID].Fuzzy)
+	assert.Nil(t, cfg.Groups[DEFAULT_GROUP_ID].FuzzyIdleTimeout)
+}
+
 // fifoYAML returns a YAML document containing the given routing.scheduler
 // settings fifo block body (pre-indented at the fifo keys' depth).
 func fifoYAML(body string) string {

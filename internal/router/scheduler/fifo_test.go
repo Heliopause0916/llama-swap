@@ -166,7 +166,7 @@ func (f *fakeEffects) startsFor(modelID string) int {
 }
 
 func newFIFO(planner Swapper, eff Effects) *FIFO {
-	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
+	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff, groupFuzzy{})
 }
 
 func req(model string) HandlerReq {
@@ -235,7 +235,7 @@ func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 // newFIFOAging builds a FIFO from cfg with the fake clock wired in and returns
 // it together with the clock, so threshold-based aging is deterministic.
 func newFIFOAging(planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) (*FIFO, *fakeClock) {
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, models, eff, groupFuzzy{})
 	clock := newFakeClock()
 	s.now = clock.now
 	return s, clock
@@ -856,7 +856,7 @@ func TestFIFO_Queued(t *testing.T) {
 	}
 
 	// An empty queue yields a nil snapshot.
-	noQueue := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, nil, eff)
+	noQueue := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, nil, eff, groupFuzzy{})
 	if got := noQueue.Queued(); got != nil {
 		t.Fatalf("Queued()=%v want nil for empty queue", got)
 	}
@@ -958,7 +958,7 @@ func newFIFOWithLimit(t *testing.T, model string, limit int) (*FIFO, *fakeEffect
 	models := map[string]config.ModelConfig{
 		model: {ConcurrencyLimit: limit},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff, groupFuzzy{})
 	return s, eff
 }
 
@@ -973,7 +973,7 @@ func TestFIFO_ConcurrencyLimit_RejectsOverLimit(t *testing.T) {
 	models := map[string]config.ModelConfig{
 		"a": {ConcurrencyLimit: 1},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff, groupFuzzy{})
 
 	// First request: served (inFlight 0 → 1).
 	r1 := req("a")
@@ -1083,7 +1083,7 @@ func TestFIFO_ConcurrencyLimit_SwapWaiters(t *testing.T) {
 	models := map[string]config.ModelConfig{
 		"a": {ConcurrencyLimit: 2},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, queueDepthOff(), models, eff, groupFuzzy{})
 
 	// Three requests arrive while model is loading: one starts swap, two join.
 	r1 := req("a")
@@ -1125,7 +1125,7 @@ func TestFIFO_ConcurrencyLimit_QueuedWaitersReserveCapacity(t *testing.T) {
 	}
 	// Queueing disabled so an over-reserved waiter is rejected up front
 	// instead of queueing, keeping this test focused on swap reservation.
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff, groupFuzzy{})
 
 	bReq := req("b")
 	aReq1 := req("a")
@@ -1173,7 +1173,7 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 	}
 	// Queueing disabled so the rejected waiter is a pure admission rejection,
 	// exercising the legacy reservation-release path on cancel.
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, queueDepthOff(), models, eff, groupFuzzy{})
 
 	bReq := req("b")
 	cancelledReq := reqCh("a")
@@ -1259,7 +1259,7 @@ func TestFIFO_Queueing_QueueFullRejects429(t *testing.T) {
 	eff.states["a"] = process.StateReady
 	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
 	one := 1
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &one, QueueTimeout: queueTimeoutInfinite()}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &one, QueueTimeout: queueTimeoutInfinite()}, models, eff, groupFuzzy{})
 
 	r1 := req("a")
 	s.OnRequest(r1)
@@ -1296,7 +1296,7 @@ func TestFIFO_Queueing_TimeoutRejects429(t *testing.T) {
 	}
 	one := 1
 	cfg := config.FifoConfig{QueueDepth: &one, QueueTimeout: &one}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff, groupFuzzy{})
 
 	// b's swap completion is the drain trigger that happens to run without
 	// freeing a's serving slot.
@@ -1435,7 +1435,7 @@ func TestFIFO_Queueing_OverLimitWaiterDoesNotJoinSwap(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateStopped
 	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff, groupFuzzy{})
 
 	r1 := req("a")
 	r2 := req("a")
@@ -1488,7 +1488,7 @@ func TestFIFO_Queueing_JoinGateCountsInFlight(t *testing.T) {
 	// Loading a evicts b only once b is running; start with b stopped so r1
 	// serves a on the fast path.
 	planner := &evictIfRunningPlanner{evict: map[string]string{"a": "b"}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, models, eff, groupFuzzy{})
 
 	// r1 is served while b is stopped and stays in flight.
 	r1 := req("a")
@@ -1562,7 +1562,7 @@ func TestFIFO_Queueing_QueueTimeoutNormalization(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateReady
 	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff, groupFuzzy{})
 	if got := s.queueTimeout; got != 60*time.Second {
 		t.Fatalf("queueTimeout=%v want default 60s", got)
 	}
@@ -1583,14 +1583,14 @@ func TestFIFO_Queueing_QueueTimeoutNormalization(t *testing.T) {
 	}
 
 	// explicit 0 -> infinite (no deadline anywhere).
-	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, nil, newFakeEffects())
+	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: queueTimeoutInfinite()}, nil, newFakeEffects(), groupFuzzy{})
 	if got := s.queueTimeout; got != 0 {
 		t.Fatalf("queueTimeout=%v want 0 (infinite)", got)
 	}
 
 	// positive value honored in seconds.
 	five := 5
-	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: &five}, nil, newFakeEffects())
+	s = NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueTimeout: &five}, nil, newFakeEffects(), groupFuzzy{})
 	if got := s.queueTimeout; got != 5*time.Second {
 		t.Fatalf("queueTimeout=%v want 5s", got)
 	}

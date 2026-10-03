@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -423,5 +424,125 @@ func waitForStageEvents(t *testing.T, mu *sync.Mutex, stages *[]string, n int) {
 			t.Fatalf("timed out waiting for %d stage events, got %d", n, got)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestServer_InflightServedModelMetadataRefresh verifies that served_model,
+// written into the shared request metadata map after Add snapshots the entry,
+// is surfaced onto the tracked entry (with an upsert event) by the next
+// updateStages tick.
+func TestServer_InflightServedModelMetadataRefresh(t *testing.T) {
+	var mu sync.Mutex
+	var upsertCount int
+	var upsertMeta map[string]string
+	tracker := newInflightTrackerWithPublisher(16, func(u swaputil.InFlightRequestsEvent) {
+		if u.Operation == inflightOperationUpsert && u.Request != nil {
+			mu.Lock()
+			upsertCount++
+			upsertMeta = u.Request.Metadata
+			mu.Unlock()
+		}
+	})
+	tracker.queueSnapshot = func() []router.QueueInfo { return nil }
+
+	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{
+		Model:    "b",
+		ModelID:  "b",
+		Metadata: map[string]string{},
+	})
+	tracker.mu.Lock()
+	tracker.requests["1"] = &inflightRequest{
+		entry: swaputil.InflightRequestEntry{ID: "1", Stage: "serving", Metadata: map[string]string{}},
+		ctx:   ctx,
+	}
+	tracker.mu.Unlock()
+
+	// No served_model yet: the tick must not produce an upsert.
+	tracker.updateStages()
+	mu.Lock()
+	if upsertCount != 0 {
+		mu.Unlock()
+		t.Fatalf("upserts=%d want 0 before served_model is written", upsertCount)
+	}
+	mu.Unlock()
+
+	// The scheduler grants the request and writes served_model afterwards.
+	if err := swaputil.SetReqData(ctx, "served_model", "a"); err != nil {
+		t.Fatalf("SetReqData: %v", err)
+	}
+
+	if !tracker.updateStages() {
+		t.Fatal("updateStages()=false want true while requests are tracked")
+	}
+
+	tracker.mu.RLock()
+	got := tracker.requests["1"].entry.Metadata["served_model"]
+	tracker.mu.RUnlock()
+	if got != "a" {
+		t.Fatalf("entry served_model=%q want %q", got, "a")
+	}
+	waitForUpserts(t, &mu, &upsertCount, 1)
+	mu.Lock()
+	defer mu.Unlock()
+	if upsertMeta["served_model"] != "a" {
+		t.Fatalf("upsert served_model=%q want %q", upsertMeta["served_model"], "a")
+	}
+}
+
+// waitForUpserts blocks until at least n upsert events have been published
+// (the publish callback runs on the tracker's async publisher goroutine).
+func waitForUpserts(t *testing.T, mu *sync.Mutex, count *int, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		got := *count
+		mu.Unlock()
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d upserts, got %d", want, got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestServer_InflightServedModelNoKeyNoChurn verifies that a request whose
+// metadata never receives served_model produces no extra upserts across ticks
+// (no metadata churn), while the stage updater keeps running.
+func TestServer_InflightServedModelNoKeyNoChurn(t *testing.T) {
+	var mu sync.Mutex
+	var upserts int
+	tracker := newInflightTrackerWithPublisher(16, func(u swaputil.InFlightRequestsEvent) {
+		if u.Operation == inflightOperationUpsert && u.Request != nil {
+			mu.Lock()
+			upserts++
+			mu.Unlock()
+		}
+	})
+	tracker.queueSnapshot = func() []router.QueueInfo { return nil }
+
+	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{
+		Model:    "b",
+		ModelID:  "b",
+		Metadata: map[string]string{"priority": "60"},
+	})
+	tracker.mu.Lock()
+	tracker.requests["1"] = &inflightRequest{
+		entry: swaputil.InflightRequestEntry{ID: "1", Stage: "serving", Metadata: map[string]string{"priority": "60"}},
+		ctx:   ctx,
+	}
+	tracker.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if !tracker.updateStages() {
+			t.Fatal("updateStages()=false want true while requests are tracked")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if upserts != 0 {
+		t.Fatalf("upserts=%d want 0 when served_model is never written", upserts)
 	}
 }
