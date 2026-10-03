@@ -390,16 +390,46 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 		delete(s.active, id)
 	}
 
-	// Drop queued requests addressed to unloaded models. Requests for other
-	// models stay queued and may benefit from drainQueue at the end.
+	// Drop queued requests addressed to unloaded models. A queued request that
+	// fuzzy substitution rewrote onto the unloaded model (Req.Model is the
+	// online member it was redirected to, RequestedModel the model the client
+	// actually asked for) is NOT dropped when its original model is still
+	// available: the rewrite is undone, its reservation moves from the
+	// unloaded model back to the original one, and the request returns to the
+	// queue. The drainQueue below re-runs the decision tree on it — with the
+	// original model now stopped and not online, that means a real switch to
+	// the model the client asked for. Requests whose original model is also
+	// being unloaded keep the legacy drop.
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, w := range s.queued {
-			if targetSet[w.Req.Model] {
-				s.grantError(w.Req, unloadErr)
+			if !targetSet[w.Req.Model] {
+				kept = append(kept, w)
 				continue
 			}
-			kept = append(kept, w)
+			if orig := w.Req.RequestedModel; orig != "" && !targetSet[orig] {
+				// Mirrors admit's capacity check for the original model, so
+				// the moved reservation can never exceed what a fresh
+				// admission would have been allowed.
+				capacity := s.limit(orig)
+				if s.queueingEnabled() {
+					capacity += s.queueDepth
+				}
+				if s.reserved[orig] >= capacity {
+					s.logger.Debugf("%s: unloading %s drops rewritten request for %s (no capacity for %s)", s.name, w.Req.Model, orig, orig)
+					s.grantError(w.Req, swaputil.ConcurrencyLimitError{RetryAfter: 1})
+					continue
+				}
+				s.release(w.Req.Model)
+				unloaded := w.Req.Model
+				w.Req.Model = orig
+				w.Req.RequestedModel = ""
+				s.reserved[orig]++
+				s.logger.Debugf("%s: unloading %s restores queued request to its original model %s", s.name, unloaded, orig)
+				kept = append(kept, w)
+				continue
+			}
+			s.grantError(w.Req, unloadErr)
 		}
 		s.queued = kept
 	}

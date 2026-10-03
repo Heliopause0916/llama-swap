@@ -151,11 +151,11 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 	tm.Src = activitySource(r)
 
-	if ctxData, ok := swaputil.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
-		tm.Metadata = make(map[string]string, len(ctxData.Metadata))
-		for k, v := range ctxData.Metadata {
-			tm.Metadata[k] = v
-		}
+	// Locked snapshot: the scheduler's run loop can still be writing metadata
+	// (served_model is written right after the grant while the handler runs),
+	// so the activity record must not read the shared map bare.
+	if snap := swaputil.MetadataSnapshot(r.Context()); len(snap) > 0 {
+		tm.Metadata = snap
 	}
 	if selectorID := selectorFromContext(r.Context()); selectorID != "" {
 		if tm.Metadata == nil {

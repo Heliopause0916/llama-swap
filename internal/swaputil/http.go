@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -33,6 +34,16 @@ type ReqContextData struct {
 	// Metadata is a request-scoped key/value bag that handlers may mutate
 	// while processing. The metrics middleware copies it into ActivityLogEntry.
 	Metadata map[string]string
+
+	// metadataMu guards Metadata. The request goroutine, the scheduler's run
+	// loop (fifo_priority / served_model at grant time) and the inflight stage
+	// updater all touch the same shared map concurrently with the request, so
+	// reads and writes must both take this lock. It is a pointer because
+	// ReqContextData is copied by value everywhere (context storage,
+	// ReadContext/FetchContext returns): a pointer keeps one lock per map.
+	// SetContext pairs a fresh Metadata with its lock at the single place
+	// request data enters a context.
+	metadataMu *sync.Mutex
 }
 
 const MaxMultiPartSize = 32 << 20
@@ -537,6 +548,13 @@ func EscapedPathSuffix(escapedPath, decodedPrefix string) string {
 }
 
 func SetContext(ctx context.Context, data ReqContextData) context.Context {
+	// Pair every metadata map with its guard mutex at the single place request
+	// data enters a context, so later SetReqData writes and the locked read
+	// helpers below are always synchronized on the same lock regardless of how
+	// many value copies the ReqContextData goes through afterwards.
+	if data.Metadata != nil && data.metadataMu == nil {
+		data.metadataMu = new(sync.Mutex)
+	}
 	return context.WithValue(ctx, ReqContextKey, data)
 }
 
@@ -549,6 +567,11 @@ func ReadContext(ctx context.Context) (ReqContextData, bool) {
 // The metadata map must already exist in the context's ReqContextData; callers
 // should ensure FetchContext has run or initialize the map themselves.
 // It returns an error for nil contexts or contexts without request data.
+//
+// The write takes the metadata lock: SetReqData runs on several goroutines
+// over the request's lifetime (the request goroutine at ingress, the
+// scheduler's run loop at grant time), and the inflight stage updater reads
+// the same map concurrently.
 func SetReqData(ctx context.Context, key, value string) error {
 	if ctx == nil {
 		return fmt.Errorf("cannot set request metadata on nil context")
@@ -560,8 +583,52 @@ func SetReqData(ctx context.Context, key, value string) error {
 	if data.Metadata == nil {
 		return fmt.Errorf("no metadata map in request context")
 	}
+	if data.metadataMu != nil {
+		data.metadataMu.Lock()
+		defer data.metadataMu.Unlock()
+	}
 	data.Metadata[key] = value
 	return nil
+}
+
+// GetReqData reads one metadata key from the request context's metadata map.
+// It takes the same lock SetReqData writes hold, so keys written after the
+// request left the caller's goroutine (the scheduler's served_model under a
+// fuzzy rewrite) can be read race-free. found is false when the context has no
+// request data or the key is absent. Contexts built without SetContext (some
+// tests) have no lock to take and read directly, as before.
+func GetReqData(ctx context.Context, key string) (string, bool) {
+	data, ok := ReadContext(ctx)
+	if !ok {
+		return "", false
+	}
+	if data.metadataMu != nil {
+		data.metadataMu.Lock()
+		defer data.metadataMu.Unlock()
+	}
+	v, found := data.Metadata[key]
+	return v, found
+}
+
+// MetadataSnapshot returns a copy of the request context's metadata map, or
+// nil when the context has no request data or an empty map. Like GetReqData it
+// takes the metadata lock, so a snapshot taken while the request is still in
+// flight (inflight entry seeding, the metrics middleware's activity record)
+// never races a concurrent SetReqData write.
+func MetadataSnapshot(ctx context.Context) map[string]string {
+	data, ok := ReadContext(ctx)
+	if !ok || len(data.Metadata) == 0 {
+		return nil
+	}
+	if data.metadataMu != nil {
+		data.metadataMu.Lock()
+		defer data.metadataMu.Unlock()
+	}
+	out := make(map[string]string, len(data.Metadata))
+	for k, v := range data.Metadata {
+		out[k] = v
+	}
+	return out
 }
 
 // extractContext pulls fields from an HTTP request into a ReqContextData,

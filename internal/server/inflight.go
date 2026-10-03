@@ -128,7 +128,10 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 	redactHeaders(entry.ReqHeaders)
 	if data, ok := swaputil.ReadContext(r.Context()); ok {
 		entry.Model = data.ModelID
-		entry.Metadata = copyMetadata(data.Metadata)
+		// Locked snapshot: the tracker goroutines (stage updater) and the
+		// scheduler's run loop read and write this same shared metadata map
+		// while the request is in flight.
+		entry.Metadata = swaputil.MetadataSnapshot(r.Context())
 	}
 
 	t.mu.Lock()
@@ -254,15 +257,15 @@ func (t *inflightTracker) updateStages() bool {
 		// UI Served column fills in without a new event channel. Only this
 		// key is synced so audit-header keys never trigger extra upserts.
 		// Entries seeded without a context (some tests) have nothing to read.
+		// GetReqData takes the metadata lock that all SetReqData writers (the
+		// scheduler's run loop, the ingress audit snapshot) hold too.
 		if req.ctx != nil {
-			if data, ok := swaputil.ReadContext(req.ctx); ok {
-				if v, found := data.Metadata["served_model"]; found && req.entry.Metadata["served_model"] != v {
-					if req.entry.Metadata == nil {
-						req.entry.Metadata = map[string]string{}
-					}
-					req.entry.Metadata["served_model"] = v
-					t.enqueueLocked(upsertInflightEvent(req.entry))
+			if v, found := swaputil.GetReqData(req.ctx, "served_model"); found && req.entry.Metadata["served_model"] != v {
+				if req.entry.Metadata == nil {
+					req.entry.Metadata = map[string]string{}
 				}
+				req.entry.Metadata["served_model"] = v
+				t.enqueueLocked(upsertInflightEvent(req.entry))
 			}
 		}
 	}

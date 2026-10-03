@@ -604,3 +604,197 @@ func TestFIFO_Fuzzy_BusyNoOnline_NotBusyRealSwitch(t *testing.T) {
 		t.Fatalf("RequestedModel=%q want empty (no rewrite)", got)
 	}
 }
+
+// fillAQueuesRewrittenB is the shared setup for the OnUnload restore tests:
+// model a (limit 2) is online and filled to its concurrency limit with two
+// plain grants, so a fuzzy request for b is rewritten onto a and parks in the
+// queue on a's capacity rules (reserved[a]=3 > limit 2). models is the per-model
+// config passed to the FIFO (may be nil; use it to tune the original model's
+// limits). Returns the queued request's HandlerReq for metadata assertions.
+func fillAQueuesRewrittenB(t *testing.T, eff *fakeEffects, models map[string]config.ModelConfig) (*FIFO, HandlerReq) {
+	t.Helper()
+	if models == nil {
+		// Default: model a's 2-slot limit is what parks the rewritten request.
+		models = map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+	}
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, models, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	eff.states["c"] = process.StateStopped
+
+	s.OnRequest(req("a"))
+	s.OnRequest(req("a"))
+	rB := reqMetaCh("b")
+	s.OnRequest(rB)
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1 (rewritten b request parked on capacity)", len(s.queued))
+	}
+	if got := s.queued[0].Req.RequestedModel; got != "b" {
+		t.Fatalf("queued[0].RequestedModel=%q want %q", got, "b")
+	}
+	return s, rB
+}
+
+func TestFIFO_Fuzzy_OnUnload_RestoresRequestedModel(t *testing.T) {
+	// Unloading the online member must not kill queued requests that fuzzy
+	// substitution rewrote onto it when the client's original model is still
+	// available: the rewrite is undone, the reservation moves back to the
+	// original model, and the request proceeds through the normal decision
+	// tree — a real switch to the model the client actually asked for.
+	eff := newFakeEffects()
+	s, rB := fillAQueuesRewrittenB(t, eff, nil)
+
+	// The unload stops a; fakeEffects.StopProcesses only records, so mirror
+	// the post-stop state before driving OnUnload.
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if got := eff.errored(""); got != 0 {
+		t.Fatalf("error grants=%d want 0 (rewritten request must not be dropped)", got)
+	}
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch after restore)", eff.startsFor("b"))
+	}
+	if eff.startsFor("a") != 0 {
+		t.Fatalf("starts for a=%d want 0", eff.startsFor("a"))
+	}
+	if len(eff.stops) != 1 || len(eff.stops[0].ids) != 1 || eff.stops[0].ids[0] != "a" {
+		t.Fatalf("StopProcesses=%+v want one call stopping [a]", eff.stops)
+	}
+
+	// The restored request swapped to b under its own name, no longer carrying
+	// the rewrite marker; its reservation moved from a back to b.
+	sw := s.active["b"]
+	if sw == nil || len(sw.waiters) != 1 {
+		t.Fatalf("active[b] waiters=%+v want one", sw.waiters)
+	}
+	if got := sw.waiters[0].Model; got != "b" {
+		t.Fatalf("waiter Model=%q want %q", got, "b")
+	}
+	if got := sw.waiters[0].RequestedModel; got != "" {
+		t.Fatalf("waiter RequestedModel=%q want empty (rewrite undone)", got)
+	}
+	if s.reserved["a"] != 2 {
+		t.Fatalf("reserved[a]=%d want 2 (rewritten slot released)", s.reserved["a"])
+	}
+	if s.reserved["b"] != 1 {
+		t.Fatalf("reserved[b]=%d want 1 (reservation moved to b)", s.reserved["b"])
+	}
+
+	// Completing the switch serves the client's original model without a
+	// served_model marker (no rewrite remains).
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+	if eff.served("b") != 1 {
+		t.Fatalf("served b=%d want 1", eff.served("b"))
+	}
+	if _, ok := metaValue(t, rB, "served_model"); ok {
+		t.Fatal("served_model written for a restored request")
+	}
+	if _, ok := metaValue(t, rB, "fifo_priority"); !ok {
+		t.Fatal("fifo_priority not written on grant")
+	}
+}
+
+func TestFIFO_Fuzzy_OnUnload_DropsWhenOriginalAlsoUnloaded(t *testing.T) {
+	// Control: when the client's original model is being unloaded too, the
+	// rewritten queued request keeps the legacy drop behavior.
+	eff := newFakeEffects()
+	s, _ := fillAQueuesRewrittenB(t, eff, nil)
+
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a", "b"}, time.Second)
+
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1 (queued request dropped)", got)
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queued=%d want 0", len(s.queued))
+	}
+	if s.reserved["a"] != 2 {
+		t.Fatalf("reserved[a]=%d want 2 (drop released the rewritten slot)", s.reserved["a"])
+	}
+}
+
+func TestFIFO_Fuzzy_OnUnload_RestoredItemAnchorsQueueHead(t *testing.T) {
+	// A restored request can stay queued (here: b is at its in-flight limit),
+	// and it then anchors the group exactly like any other queued member: a
+	// later fuzzy request for c follows the queue head b instead of starting a
+	// competing switch to c. Without the restore the queue would be empty and
+	// c would have switched for real.
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+		"b": {ConcurrencyLimit: 1},
+	}
+	eff := newFakeEffects()
+	s, _ := fillAQueuesRewrittenB(t, eff, models)
+	// Keep the restored request queued: b is already serving one request.
+	s.inFlight["b"] = 1
+
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if got := eff.errored(""); got != 0 {
+		t.Fatalf("error grants=%d want 0", got)
+	}
+	if len(s.queued) != 1 {
+		t.Fatalf("queued=%d want 1 (restored request waits at b's limit)", len(s.queued))
+	}
+	if got := s.queued[0].Req.Model; got != "b" {
+		t.Fatalf("queued[0].Model=%q want %q (rewrite undone)", got, "b")
+	}
+	if got := s.queued[0].Req.RequestedModel; got != "" {
+		t.Fatalf("queued[0].RequestedModel=%q want empty", got)
+	}
+
+	// A fuzzy request for c now follows the restored queue head.
+	rC := reqMetaCh("c")
+	s.OnRequest(rC)
+	if eff.startsFor("c") != 0 {
+		t.Fatalf("starts for c=%d want 0 (follows the restored queue head)", eff.startsFor("c"))
+	}
+	if len(s.queued) != 2 {
+		t.Fatalf("queued=%d want 2", len(s.queued))
+	}
+	if got := s.queued[1].Req.Model; got != "b" {
+		t.Fatalf("queued[1].Model=%q want %q (c followed b)", got, "b")
+	}
+	if got := s.queued[1].Req.RequestedModel; got != "c" {
+		t.Fatalf("queued[1].RequestedModel=%q want %q", got, "c")
+	}
+}
+
+func TestFIFO_Fuzzy_OnUnload_RestoreNoCapacityErrors(t *testing.T) {
+	// If the original model's admission capacity is exhausted, the restored
+	// request gets the same rejection a fresh admission would have received
+	// instead of silently overshooting the capacity bookkeeping.
+	models := map[string]config.ModelConfig{
+		"a": {ConcurrencyLimit: 2},
+		"b": {ConcurrencyLimit: 2},
+	}
+	eff := newFakeEffects()
+	s, _ := fillAQueuesRewrittenB(t, eff, models)
+	// Simulate b's queue being full: limit 2 + default queueDepth 10 slots.
+	s.reserved["b"] = 12
+
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a"}, time.Second)
+
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1 (no capacity for the original model)", got)
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queued=%d want 0", len(s.queued))
+	}
+	if s.reserved["b"] != 12 {
+		t.Fatalf("reserved[b]=%d want 12 (untouched)", s.reserved["b"])
+	}
+	if s.reserved["a"] != 2 {
+		t.Fatalf("reserved[a]=%d want 2", s.reserved["a"])
+	}
+}
