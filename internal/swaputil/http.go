@@ -614,15 +614,20 @@ func GetReqData(ctx context.Context, key string) (string, bool) {
 // nil when the context has no request data or an empty map. Like GetReqData it
 // takes the metadata lock, so a snapshot taken while the request is still in
 // flight (inflight entry seeding, the metrics middleware's activity record)
-// never races a concurrent SetReqData write.
+// never races a concurrent SetReqData write. The empty-map check runs under
+// the lock too: len(map) is a map read and races a concurrent mapassign just
+// like any other.
 func MetadataSnapshot(ctx context.Context) map[string]string {
 	data, ok := ReadContext(ctx)
-	if !ok || len(data.Metadata) == 0 {
+	if !ok {
 		return nil
 	}
 	if data.metadataMu != nil {
 		data.metadataMu.Lock()
 		defer data.metadataMu.Unlock()
+	}
+	if len(data.Metadata) == 0 {
+		return nil
 	}
 	out := make(map[string]string, len(data.Metadata))
 	for k, v := range data.Metadata {

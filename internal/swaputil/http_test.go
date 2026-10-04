@@ -676,6 +676,46 @@ func TestSetReqData_Errors(t *testing.T) {
 	}
 }
 
+func TestMetadataSnapshot(t *testing.T) {
+	// No request context data at all.
+	if snap := MetadataSnapshot(context.Background()); snap != nil {
+		t.Errorf("snapshot without context data = %v, want nil", snap)
+	}
+
+	// Empty map: nil snapshot (locked path — SetContext pairs the mutex).
+	emptyCtx := SetContext(context.Background(), ReqContextData{ModelID: "m1", Metadata: make(map[string]string)})
+	if snap := MetadataSnapshot(emptyCtx); snap != nil {
+		t.Errorf("snapshot of empty metadata = %v, want nil", snap)
+	}
+
+	// Non-empty map: a copy that mirrors the values but is independent of the
+	// shared map underneath.
+	ctx := SetContext(context.Background(), ReqContextData{ModelID: "m1", Metadata: make(map[string]string)})
+	if err := SetReqData(ctx, "client", "web"); err != nil {
+		t.Fatalf("SetReqData: %v", err)
+	}
+	snap := MetadataSnapshot(ctx)
+	if snap["client"] != "web" {
+		t.Fatalf("snapshot client = %q, want %q", snap["client"], "web")
+	}
+	snap["client"] = "mutated"
+	snap["extra"] = "leak"
+	data, _ := ReadContext(ctx)
+	if data.Metadata["client"] != "web" || len(data.Metadata) != 1 {
+		t.Errorf("shared metadata mutated through snapshot: %v", data.Metadata)
+	}
+
+	// Contexts built without SetContext (no paired mutex) keep the pre-lock
+	// behavior: direct copy of a non-empty map.
+	bareCtx := context.WithValue(context.Background(), ReqContextKey, ReqContextData{
+		ModelID:  "m1",
+		Metadata: map[string]string{"trace": "m1"},
+	})
+	if snap := MetadataSnapshot(bareCtx); snap == nil || snap["trace"] != "m1" {
+		t.Errorf("snapshot without mutex = %v, want trace=m1", snap)
+	}
+}
+
 func TestServer_ExtractAPIKey(t *testing.T) {
 	basicHeader := func(user, pass string) string {
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
