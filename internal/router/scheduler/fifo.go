@@ -379,27 +379,32 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	// Release waiters of any in-flight swap whose target is being unloaded.
 	// The swap goroutine itself is left to finish on its own; when its
 	// SwapDone arrives, OnSwapDone will find no entry in active and drop it.
+	// Waiters that fuzzy substitution rewrote onto the swap target get the
+	// same restore treatment as queued requests below (restoreRewritten).
 	for id := range targetSet {
 		sw, ok := s.active[id]
 		if !ok {
 			continue
 		}
 		for _, w := range sw.waiters {
-			s.grantError(w, unloadErr)
+			restored, err := s.restoreRewritten(w, targetSet, unloadErr)
+			if err != nil {
+				s.grantError(w, err)
+				continue
+			}
+			// Back into the queue with a fresh queue window; the drainQueue
+			// below re-runs the decision tree on it — with the rewritten
+			// model now stopped and not online, that means a real switch to
+			// the model the client actually asked for.
+			s.enqueue(restored, s.deadline())
 		}
 		delete(s.active, id)
 	}
 
-	// Drop queued requests addressed to unloaded models. A queued request that
-	// fuzzy substitution rewrote onto the unloaded model (Req.Model is the
-	// online member it was redirected to, RequestedModel the model the client
-	// actually asked for) is NOT dropped when its original model is still
-	// available: the rewrite is undone, its reservation moves from the
-	// unloaded model back to the original one, and the request returns to the
-	// queue. The drainQueue below re-runs the decision tree on it — with the
-	// original model now stopped and not online, that means a real switch to
-	// the model the client asked for. Requests whose original model is also
-	// being unloaded keep the legacy drop.
+	// Drop queued requests addressed to unloaded models. Requests for other
+	// models stay queued and may benefit from drainQueue at the end. A queued
+	// request that fuzzy substitution rewrote onto an unloaded model gets the
+	// shared restoreRewritten treatment (same as swap waiters above).
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, w := range s.queued {
@@ -407,29 +412,13 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 				kept = append(kept, w)
 				continue
 			}
-			if orig := w.Req.RequestedModel; orig != "" && !targetSet[orig] {
-				// Mirrors admit's capacity check for the original model, so
-				// the moved reservation can never exceed what a fresh
-				// admission would have been allowed.
-				capacity := s.limit(orig)
-				if s.queueingEnabled() {
-					capacity += s.queueDepth
-				}
-				if s.reserved[orig] >= capacity {
-					s.logger.Debugf("%s: unloading %s drops rewritten request for %s (no capacity for %s)", s.name, w.Req.Model, orig, orig)
-					s.grantError(w.Req, swaputil.ConcurrencyLimitError{RetryAfter: 1})
-					continue
-				}
-				s.release(w.Req.Model)
-				unloaded := w.Req.Model
-				w.Req.Model = orig
-				w.Req.RequestedModel = ""
-				s.reserved[orig]++
-				s.logger.Debugf("%s: unloading %s restores queued request to its original model %s", s.name, unloaded, orig)
-				kept = append(kept, w)
+			restored, err := s.restoreRewritten(w.Req, targetSet, unloadErr)
+			if err != nil {
+				s.grantError(w.Req, err)
 				continue
 			}
-			s.grantError(w.Req, unloadErr)
+			w.Req = restored
+			kept = append(kept, w)
 		}
 		s.queued = kept
 	}
@@ -443,6 +432,44 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	// Removing entries from active above may have unblocked queued requests
 	// that previously collided with the now-cancelled swaps.
 	s.drainQueue()
+}
+
+// restoreRewritten handles a request parked against a model being unloaded
+// (a queued item or an in-flight swap waiter) that fuzzy substitution
+// rewrote onto it: Req.Model is the online member it was redirected to,
+// RequestedModel the model the client actually asked for. The rewrite is
+// undone, the reservation moves from the unloaded model back to the original
+// one, and the request returns to the queue for the normal drainQueue
+// decision tree — with the original model now stopped and not online, that
+// means a real switch to the model the client asked for.
+//
+// A nil error means the request was restored and must be requeued by the
+// caller. A non-nil error is the rejection to grant instead: the standard
+// "model unloaded" error when the client's original model is also being
+// unloaded (or no rewrite happened), or a concurrency-limit rejection when
+// the original model's admission capacity is exhausted — mirroring admit's
+// capacity check, so the moved reservation can never exceed what a fresh
+// admission would have been allowed.
+func (s *FIFO) restoreRewritten(req HandlerReq, targetSet map[string]bool, unloadErr error) (HandlerReq, error) {
+	orig := req.RequestedModel
+	if orig == "" || targetSet[orig] {
+		return req, unloadErr
+	}
+	capacity := s.limit(orig)
+	if s.queueingEnabled() {
+		capacity += s.queueDepth
+	}
+	if s.reserved[orig] >= capacity {
+		s.logger.Debugf("%s: unloading %s drops rewritten request for %s (no capacity for %s)", s.name, req.Model, orig, orig)
+		return req, swaputil.ConcurrencyLimitError{RetryAfter: 1}
+	}
+	s.release(req.Model)
+	unloaded := req.Model
+	req.Model = orig
+	req.RequestedModel = ""
+	s.reserved[orig]++
+	s.logger.Debugf("%s: unloading %s restores rewritten request to its original model %s", s.name, unloaded, orig)
+	return req, nil
 }
 
 // OnShutdown grants err to every waiter still held by the scheduler.
@@ -935,6 +962,14 @@ func (s *FIFO) fuzzyFollowGroup(gid string) string {
 // neither. A swap group holds at most one online member, but a stopping
 // sibling can transiently overlap with the next member, so candidates are
 // collected and sorted rather than assumed unique.
+//
+// Member exclusion boundaries (what counts as "online" for a rewrite):
+// a healthy running member is followed; a member that was just stopped
+// manually or crashed has only dying handlers left and is not followed
+// (fuzzyFollowGroup keeps no in-flight fallback, see 13102c0); and a member
+// that an in-flight swap is currently evicting is not followed either — a
+// request rewritten onto it would collide with the swap, sit queued, and then
+// pay a second full switch to the same model once it stops.
 func (s *FIFO) fuzzyOnline(gid string) string {
 	var targets []string
 	for target := range s.active {
@@ -947,9 +982,18 @@ func (s *FIFO) fuzzyOnline(gid string) string {
 		return targets[0]
 	}
 
+	// Members any active swap is evicting are on their way out; do not offer
+	// them as rewrite targets.
+	evicting := make(map[string]bool)
+	for _, sw := range s.active {
+		for _, e := range sw.evict {
+			evicting[e] = true
+		}
+	}
+
 	var ready, others []string
 	for id, state := range s.effects.RunningModels() {
-		if s.memberOf(id) != gid {
+		if s.memberOf(id) != gid || evicting[id] {
 			continue
 		}
 		if state == process.StateReady {

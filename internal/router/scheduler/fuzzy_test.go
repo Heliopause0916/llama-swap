@@ -558,6 +558,152 @@ func TestFIFO_Fuzzy_BusyNoOnline_QueueHeadFollows(t *testing.T) {
 	}
 }
 
+func TestFIFO_Fuzzy_OnUnload_RestoresSwapWaiter(t *testing.T) {
+	// Same asymmetry fix as the queued-request restore: a swap waiter that
+	// fuzzy substitution rewrote onto the swap target being unloaded must not
+	// be killed when the client's original model is still available. The
+	// rewrite is undone and the request requeues for a real switch.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStarting // a's swap is in flight
+	eff.states["b"] = process.StateStopped
+	eff.states["c"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+
+	// A plain request starts the swap to a; a fuzzy request for b joins as a
+	// rewritten waiter.
+	s.OnRequest(req("a"))
+	rB := reqMetaCh("b")
+	s.OnRequest(rB)
+	if len(s.active["a"].waiters) != 2 {
+		t.Fatalf("waiters=%d want 2 (plain + rewritten)", len(s.active["a"].waiters))
+	}
+	if got := s.active["a"].waiters[1].RequestedModel; got != "b" {
+		t.Fatalf("waiter RequestedModel=%q want %q", got, "b")
+	}
+
+	// Unloading the swap target a stops it (mirrored in the fake states).
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a"}, time.Second)
+
+	// The plain waiter gets the unload error; the rewritten waiter is
+	// restored to b and requeues, where the drain starts a real switch.
+	if got := eff.errored("a"); got != 1 {
+		t.Fatalf("errored(a)=%d want 1 (plain waiter only)", got)
+	}
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch after restore)", eff.startsFor("b"))
+	}
+	// a was switched to once by the setup (the in-flight swap); the unload
+	// must not start any additional switch for it.
+	if eff.startsFor("a") != 1 {
+		t.Fatalf("starts for a=%d want 1 (setup switch only)", eff.startsFor("a"))
+	}
+	sw := s.active["b"]
+	if sw == nil || len(sw.waiters) != 1 {
+		t.Fatalf("active[b]=%+v want one waiter", sw)
+	}
+	if got := sw.waiters[0].Model; got != "b" {
+		t.Fatalf("waiter Model=%q want %q", got, "b")
+	}
+	if got := sw.waiters[0].RequestedModel; got != "" {
+		t.Fatalf("waiter RequestedModel=%q want empty (rewrite undone)", got)
+	}
+	if s.reserved["a"] != 0 {
+		t.Fatalf("reserved[a]=%d want 0 (both waiters released)", s.reserved["a"])
+	}
+	if s.reserved["b"] != 1 {
+		t.Fatalf("reserved[b]=%d want 1 (reservation moved to b)", s.reserved["b"])
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queued=%d want 0", len(s.queued))
+	}
+
+	// Completing the switch serves the client's original model without a
+	// served_model marker (no rewrite remains).
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+	if eff.served("b") != 1 {
+		t.Fatalf("served b=%d want 1", eff.served("b"))
+	}
+	if _, ok := metaValue(t, rB, "served_model"); ok {
+		t.Fatal("served_model written for a restored waiter")
+	}
+}
+
+func TestFIFO_Fuzzy_OnUnload_SwapWaiterDropsWhenOriginalAlsoUnloaded(t *testing.T) {
+	// Control: when the client's original model is being unloaded too, the
+	// rewritten swap waiter keeps the legacy unload rejection.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStarting
+	eff.states["b"] = process.StateStopped
+	eff.states["c"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+
+	s.OnRequest(req("a"))
+	s.OnRequest(reqMetaCh("b"))
+
+	eff.states["a"] = process.StateStopped
+	s.OnUnload([]string{"a", "b"}, time.Second)
+
+	if got := eff.errored("a"); got != 2 {
+		t.Fatalf("errored(a)=%d want 2 (both waiters dropped)", got)
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queued=%d want 0", len(s.queued))
+	}
+}
+
+func TestFIFO_Fuzzy_OnlineExcludesEvictingMember(t *testing.T) {
+	// A member an in-flight swap is evicting (its process not stopped yet) is
+	// not offered as a fuzzy rewrite target: a request rewritten onto it would
+	// collide with the swap, queue, and then pay a second full switch to the
+	// same model. The request keeps its own model and switches for real.
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["c"] = process.StateStopped
+	s, _ := newFIFOFuzzy(&stubPlanner{}, eff, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	// A swap to non-member x is evicting the online group member a.
+	s.active["x"] = &activeSwap{modelID: "x", evict: []string{"a"}}
+
+	r := reqMetaCh("c")
+	s.OnRequest(r)
+
+	if eff.startsFor("c") != 1 {
+		t.Fatalf("starts for c=%d want 1 (real switch, evicting member not followed)", eff.startsFor("c"))
+	}
+	if eff.startsFor("a") != 0 {
+		t.Fatalf("starts for a=%d want 0", eff.startsFor("a"))
+	}
+	if got := s.active["c"].waiters[0].RequestedModel; got != "" {
+		t.Fatalf("RequestedModel=%q want empty (no rewrite)", got)
+	}
+
+	// Control: with the eviction targeting a non-member instead, the healthy
+	// online member a is followed as usual (group busy via member b's
+	// in-flight request).
+	eff2 := newFakeEffects()
+	eff2.states["a"] = process.StateReady
+	eff2.states["b"] = process.StateStopped
+	eff2.states["c"] = process.StateStopped
+	s2, _ := newFIFOFuzzy(&stubPlanner{}, eff2, nil, fuzzyFor([]string{"a", "b", "c"}, "g", 300))
+	s2.active["x"] = &activeSwap{modelID: "x", evict: []string{"z"}}
+	s2.inFlight["b"] = 1
+
+	r2 := reqMeta("c")
+	s2.OnRequest(r2)
+	if eff2.served("a") != 1 {
+		t.Fatalf("served a=%d want 1 (healthy online member followed)", eff2.served("a"))
+	}
+	if eff2.lastServeReq.RequestedModel != "c" {
+		t.Fatalf("RequestedModel=%q want %q", eff2.lastServeReq.RequestedModel, "c")
+	}
+	if v, ok := metaValue(t, r2, "served_model"); !ok || v != "a" {
+		t.Fatalf("served_model=%q (found=%v) want %q", v, ok, "a")
+	}
+}
+
 func TestFIFO_Fuzzy_BusyNoOnline_DyingInflightRealSwitch(t *testing.T) {
 	// Queue empty but a member still has in-flight requests: those handlers
 	// are "dying" — draining from a member that was just stopped manually or
