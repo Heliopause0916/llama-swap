@@ -909,26 +909,21 @@ func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
 // fuzzyFollowGroup implements the busy-without-online rule: when a fuzzy group
 // is busy but has no online member and no in-flight swap targeting one (the
 // fuzzyOnline "" case), a new request follows the model the group's traffic is
-// already committed to — the earliest queued group member (the queue head)
-// first, else a member that still has in-flight requests (e.g. a member that
-// was just unloaded while its handlers drain). Empty when neither source has a
-// group member, in which case no switch target can be decided and the request
-// keeps its own model.
+// already committed to — the earliest queued group member (the queue head).
+//
+// There is deliberately no fallback to members that still have in-flight
+// requests: inFlight > 0 with no online member and no queued traffic can only
+// mean handlers still draining from a member that was just stopped manually or
+// crashed ("dying" requests). Following such a model would bounce the group
+// back onto the model the user just removed; the new request keeps its own
+// model instead and performs a real switch, naturally carrying the group away
+// from it. Empty when nothing is queued, in which case no switch target can be
+// decided and the request keeps its own model.
 func (s *FIFO) fuzzyFollowGroup(gid string) string {
 	for _, item := range s.queued {
 		if s.memberOf(item.Req.Model) == gid {
 			return item.Req.Model
 		}
-	}
-	var serving []string
-	for m, n := range s.inFlight {
-		if n > 0 && s.memberOf(m) == gid {
-			serving = append(serving, m)
-		}
-	}
-	if len(serving) > 0 {
-		sort.Strings(serving)
-		return serving[0]
 	}
 	return ""
 }

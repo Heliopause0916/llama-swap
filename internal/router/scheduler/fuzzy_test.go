@@ -558,10 +558,12 @@ func TestFIFO_Fuzzy_BusyNoOnline_QueueHeadFollows(t *testing.T) {
 	}
 }
 
-func TestFIFO_Fuzzy_BusyNoOnline_FollowsInFlightMember(t *testing.T) {
-	// Queue empty but a member still has in-flight requests (e.g. it was
-	// unloaded while its handlers drain): the in-flight member decides the
-	// switch target.
+func TestFIFO_Fuzzy_BusyNoOnline_DyingInflightRealSwitch(t *testing.T) {
+	// Queue empty but a member still has in-flight requests: those handlers
+	// are "dying" — draining from a member that was just stopped manually or
+	// crashed (fuzzyOnline is empty). Following them would bounce the group
+	// back onto the model that was just removed, so the new request keeps its
+	// own model and performs a real switch.
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateStopped
 	eff.states["b"] = process.StateStopped
@@ -571,15 +573,15 @@ func TestFIFO_Fuzzy_BusyNoOnline_FollowsInFlightMember(t *testing.T) {
 	r := reqMeta("b")
 	s.OnRequest(r)
 
-	if eff.startsFor("a") != 1 {
-		t.Fatalf("starts for a=%d want 1 (in-flight member decides the target)", eff.startsFor("a"))
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("starts for b=%d want 1 (real switch, dying in-flight is not followed)", eff.startsFor("b"))
 	}
-	if eff.startsFor("b") != 0 {
-		t.Fatalf("starts for b=%d want 0", eff.startsFor("b"))
+	if eff.startsFor("a") != 0 {
+		t.Fatalf("starts for a=%d want 0", eff.startsFor("a"))
 	}
-	sw := s.active["a"]
-	if len(sw.waiters) != 1 || sw.waiters[0].RequestedModel != "b" {
-		t.Fatalf("waiters=%d RequestedModel=%q want 1/%q", len(sw.waiters), sw.waiters[0].RequestedModel, "b")
+	sw := s.active["b"]
+	if len(sw.waiters) != 1 || sw.waiters[0].RequestedModel != "" {
+		t.Fatalf("waiters=%d RequestedModel=%q want 1/empty (no rewrite)", len(sw.waiters), sw.waiters[0].RequestedModel)
 	}
 }
 
