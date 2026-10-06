@@ -53,10 +53,11 @@ func newTrackedServeBase(t *testing.T, processes map[string]process.Process) *ba
 // rewrite). The inner fakeProcess then serves exactly like the real one.
 type forwardingCapture struct {
 	*fakeProcess
-	mu    sync.Mutex
-	model string
-	body  string
-	ctx   context.Context
+	mu            sync.Mutex
+	model         string
+	body          string
+	contentLength int64
+	ctx           context.Context
 }
 
 func newForwardingCapture(id string) *forwardingCapture {
@@ -78,6 +79,7 @@ func (c *forwardingCapture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.model = m
 	c.body = string(body)
+	c.contentLength = r.ContentLength
 	c.ctx = r.Context()
 	c.mu.Unlock()
 	c.fakeProcess.ServeHTTP(w, r)
@@ -104,6 +106,13 @@ func (c *forwardingCapture) bodySeen() string {
 	return c.body
 }
 
+// contentLengthSeen returns the Content-Length observed by the process.
+func (c *forwardingCapture) contentLengthSeen() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contentLength
+}
+
 func TestBaseRouter_TrackedServe_RewritesForwardedModel(t *testing.T) {
 	capture := newForwardingCapture("a")
 	b := newTrackedServeBase(t, map[string]process.Process{"a": capture})
@@ -125,6 +134,17 @@ func TestBaseRouter_TrackedServe_RewritesForwardedModel(t *testing.T) {
 	}
 	if got := capture.modelSeen(t); got != "a" {
 		t.Fatalf("model in forwarded request = %q, want %q", got, "a")
+	}
+
+	// The rewritten request must carry the full rewritten body and a
+	// Content-Length matching it: a backend that rejects mismatched lengths
+	// must not see the original length for the rewritten model.
+	const wantBody = `{"model":"a"}`
+	if got := capture.bodySeen(); got != wantBody {
+		t.Fatalf("forwarded body = %q, want %q", got, wantBody)
+	}
+	if got := capture.contentLengthSeen(); got != int64(len(wantBody)) {
+		t.Fatalf("forwarded Content-Length = %d, want %d", got, len(wantBody))
 	}
 
 	// ReplaceRequestModel invalidates the cached request context; the

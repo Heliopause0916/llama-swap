@@ -307,9 +307,16 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 		// invalidates the cached request context, so restore the original ctx
 		// onto the rewritten request: the defer above and downstream
 		// bookkeeping read InflightID/metadata from it. A rewrite failure (e.g.
-		// unreadable or broken JSON) forwards the original request, logged.
+		// unreadable or broken JSON) forwards the original request, logged. When
+		// the request does not encode the context's model, ReplaceRequestModel
+		// returns it unchanged with no error — a silent no-op, e.g. a body
+		// naming a model other than the one the context resolved — so the skip
+		// is debug-logged rather than invisible.
 		if data, ok := swaputil.ReadContext(r.Context()); ok && data.Model != "" && data.Model != modelID {
 			if updated, err := swaputil.ReplaceRequestModel(r, data.Model, modelID); err == nil {
+				if updated == r {
+					b.logger.Debugf("%s: model %q not found in forwarded request, leaving body as-is", b.name, data.Model)
+				}
 				r = updated.WithContext(r.Context())
 			} else {
 				b.logger.Warnf("%s: could not rewrite model %q to %q: %v", b.name, data.Model, modelID, err)
