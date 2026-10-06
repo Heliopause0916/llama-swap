@@ -296,6 +296,25 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 			case <-b.shutdownCtx.Done():
 			}
 		}()
+
+		// Fuzzy substitution and alias resolution serve a model under a
+		// different name than the client sent: the forwarded model field
+		// would still name the request's original model, and a backend that
+		// validates model names would reject it (404 model does not exist).
+		// When the serving process's model differs from the one the client
+		// asked for, rewrite the model wherever the request encodes it before
+		// forwarding (same shape as Peer.ServeHTTP). ReplaceRequestModel
+		// invalidates the cached request context, so restore the original ctx
+		// onto the rewritten request: the defer above and downstream
+		// bookkeeping read InflightID/metadata from it. A rewrite failure (e.g.
+		// unreadable or broken JSON) forwards the original request, logged.
+		if data, ok := swaputil.ReadContext(r.Context()); ok && data.Model != "" && data.Model != modelID {
+			if updated, err := swaputil.ReplaceRequestModel(r, data.Model, modelID); err == nil {
+				r = updated.WithContext(r.Context())
+			} else {
+				b.logger.Warnf("%s: could not rewrite model %q to %q: %v", b.name, data.Model, modelID, err)
+			}
+		}
 		p.ServeHTTP(w, r)
 	}
 }

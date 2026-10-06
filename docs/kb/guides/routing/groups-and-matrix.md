@@ -100,14 +100,16 @@ fails to load otherwise (which also keeps spillover selectors, which require
 
 Things worth knowing:
 
-- **The request body is not rewritten.** The upstream backend receives the
-  model name the client asked for. Backends that strictly validate the `model`
-  field need a matching `filters`/`useModelName` setup (or must tolerate the
-  original name).
-- **The Activity view shows the truth.** Fuzzed requests record
-  `served_model` in their metadata, rendered as the Served column of the
-  In-flight table and included in the activity record metadata. No key means
-  no substitution happened.
+- **The model field is rewritten for the upstream.** Because a fuzzed request
+  is served by a different model than the client asked for, the `model` field
+  in the forwarded request (JSON body, query string, or `/upstream/<model>/`
+  path) is rewritten to the actually-serving model name before it reaches the
+  backend — otherwise a backend that strictly validates `model` would reject it
+  with "model does not exist". The client's request is never modified; the
+  rewrite happens only at the forwarding chain. The Activity view records the
+  client-asked name alongside `served_model`, rendered as the Served column of
+  the In-flight table and included in the activity record metadata. No key
+  means no substitution happened.
 - **Hot reloads reset the idle clock.** Rebuilding the server on a config
   change loses the last-served timestamp, so the first request after a reload
   may trigger one real switch.
