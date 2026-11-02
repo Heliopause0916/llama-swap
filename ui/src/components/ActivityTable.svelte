@@ -202,7 +202,8 @@
       { id: "session_id", label: "Session ID", defaultVisible: true },
       { id: "bytes_received", label: "Bytes Received", defaultVisible: true },
       { id: "priority", label: "Priority", defaultVisible: false },
-      { id: "served", label: "Served", defaultVisible: false }
+      { id: "served", label: "Served", defaultVisible: false },
+      { id: "stage", label: "Stage", defaultVisible: false }
     );
     return cols;
   }
@@ -824,6 +825,14 @@
                   {:else if columnId === "served"}
                     {@const served = request.metadata?.served_model}
                     <MiddleEllipsis value={served ?? "—"} tailLength={10} className="max-w-[14rem] text-xs" />
+                  {:else if columnId === "stage"}
+                    {#if request.stage === "queued"}
+                      <span class="inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-xs tabular-nums">
+                        Queued #{request.queue_position ?? "—"}
+                      </span>
+                    {:else}
+                      <span class="text-xs">Serving</span>
+                    {/if}
                   {/if}
                 </Table.Cell>
               {/each}

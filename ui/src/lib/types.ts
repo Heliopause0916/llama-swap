@@ -132,6 +132,8 @@ export interface InflightRequestEntry {
   elapsed_ms: number;
   client_received_at_ms?: number;
   metadata?: Record<string, string>;
+  stage?: "queued" | "serving";
+  queue_position?: number;
 }
 
 export interface InFlightStats {
