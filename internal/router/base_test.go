@@ -703,8 +703,19 @@ func TestBaseRouter_ModelNotFound(t *testing.T) {
 
 func TestBaseRouter_ConcurrencyLimitRejectsBeforeLoadingStream(t *testing.T) {
 	sendLoading := true
+	// queueDepth=0 keeps over-limit requests rejected at admission (429)
+	// rather than queued, which is the concurrency-limit semantics this test
+	// exercises (the scheduler default of 10 would queue the 3rd request).
+	qd := 0
 	conf := config.Config{
 		HealthCheckTimeout: 5,
+		Routing: config.RoutingConfig{
+			Scheduler: config.SchedulerConfig{
+				Settings: config.SchedulerSettings{
+					Fifo: config.FifoConfig{QueueDepth: &qd},
+				},
+			},
+		},
 		Models: map[string]config.ModelConfig{
 			"a": {ConcurrencyLimit: 2, SendLoadingState: &sendLoading},
 			"b": {},

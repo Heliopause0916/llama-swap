@@ -65,6 +65,10 @@ type inflightRequest struct {
 	cancel      context.CancelFunc
 	lastEmitted time.Time
 	timer       *time.Timer
+	// ctx is the request context captured at Add. Its ReqContextData.Metadata
+	// map is shared, so keys written after the entry snapshot (e.g. the
+	// scheduler's served_model) remain readable here.
+	ctx context.Context
 }
 
 func newInflightTracker() *inflightTracker {
@@ -100,7 +104,7 @@ func (t *inflightTracker) Add(r *http.Request, cancel context.CancelFunc) string
 	}
 
 	t.mu.Lock()
-	req := &inflightRequest{entry: entry, cancel: cancel, lastEmitted: time.Now()}
+	req := &inflightRequest{entry: entry, cancel: cancel, lastEmitted: time.Now(), ctx: r.Context()}
 	t.requests[id] = req
 	t.enqueueLocked(upsertInflightEvent(req.entry))
 	t.mu.Unlock()
@@ -250,9 +254,32 @@ func (t *inflightTracker) Current() swaputil.InFlightRequestsEvent {
 	}
 }
 
+// syncServedModelLocked surfaces the scheduler's served_model key (written at
+// grant time, after the Add snapshot) into the entry so the UI Served column
+// fills in. Only this key is synced so audit-header keys never trigger extra
+// upserts. The value is read through ReqContextData.MetadataValue, which locks
+// the shared metadata map, so it cannot race with the scheduler's concurrent
+// SetReqData write on its run-loop goroutine.
+func (t *inflightTracker) syncServedModelLocked(req *inflightRequest) {
+	data, ok := swaputil.ReadContext(req.ctx)
+	if !ok {
+		return
+	}
+	v, found := data.MetadataValue("served_model")
+	if !found || req.entry.Metadata["served_model"] == v {
+		return
+	}
+	if req.entry.Metadata == nil {
+		req.entry.Metadata = map[string]string{}
+	}
+	req.entry.Metadata["served_model"] = v
+	t.enqueueLocked(upsertInflightEvent(req.entry))
+}
+
 func (t *inflightTracker) snapshotLocked() []swaputil.InflightRequestEntry {
 	requests := make([]swaputil.InflightRequestEntry, 0, len(t.requests))
 	for _, req := range t.requests {
+		t.syncServedModelLocked(req)
 		requests = append(requests, copyInflightEntry(req.entry))
 	}
 	sort.Slice(requests, func(i, j int) bool {

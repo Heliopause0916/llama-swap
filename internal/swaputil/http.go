@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -33,6 +34,11 @@ type ReqContextData struct {
 	// Metadata is a request-scoped key/value bag that handlers may mutate
 	// while processing. The metrics middleware copies it into ActivityLogEntry.
 	Metadata map[string]string
+	// mu guards Metadata so the scheduler run-loop (SetReqData) and the
+	// inflight snapshot reader (MetadataValue) can access the shared map
+	// concurrently without a data race. It is initialized in SetContext, so
+	// every value copy of ReqContextData shares the same lock.
+	mu *sync.RWMutex
 }
 
 const MaxMultiPartSize = 32 << 20
@@ -502,12 +508,37 @@ func EscapedPathSuffix(escapedPath, decodedPrefix string) string {
 }
 
 func SetContext(ctx context.Context, data ReqContextData) context.Context {
+	// Initialize the metadata lock on the value about to be stored so every
+	// later ReadContext copy shares the same mutex guarding Metadata.
+	if data.mu == nil {
+		data.mu = &sync.RWMutex{}
+	}
 	return context.WithValue(ctx, ReqContextKey, data)
 }
 
 func ReadContext(ctx context.Context) (ReqContextData, bool) {
 	data, ok := ctx.Value(ReqContextKey).(ReqContextData)
 	return data, ok
+}
+
+// lock returns the mutex guarding Metadata, lazily initializing it if this value
+// never went through SetContext (e.g. a zero-value struct used in a test).
+func (d *ReqContextData) lock() *sync.RWMutex {
+	if d.mu == nil {
+		d.mu = &sync.RWMutex{}
+	}
+	return d.mu
+}
+
+// MetadataValue returns the value for key from the metadata map. It locks the
+// shared mutex so a read here cannot race with a concurrent SetReqData from the
+// scheduler run-loop goroutine.
+func (d *ReqContextData) MetadataValue(key string) (string, bool) {
+	mu := d.lock()
+	mu.RLock()
+	defer mu.RUnlock()
+	v, ok := d.Metadata[key]
+	return v, ok
 }
 
 // SetReqData attaches a key/value pair to the request context's metadata map.
@@ -522,6 +553,9 @@ func SetReqData(ctx context.Context, key, value string) error {
 	if !ok {
 		return fmt.Errorf("no request context data found")
 	}
+	mu := data.lock()
+	mu.Lock()
+	defer mu.Unlock()
 	if data.Metadata == nil {
 		return fmt.Errorf("no metadata map in request context")
 	}

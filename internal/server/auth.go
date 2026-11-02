@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -59,6 +60,17 @@ func CreateRequestContextMiddleware(cfg config.Config) chain.Middleware {
 				return
 			}
 			_ = data
+			// Resolve the request-priority band into the request metadata so
+			// the in-flight Priority column can display it. The scheduler
+			// resolves the same header separately (base.go) for its ordering
+			// key; both read through the same FifoConfig so they stay in sync.
+			fifo := cfg.Routing.Scheduler.Settings.Fifo
+			if p, on := fifo.ResolvePriority(r.Header.Get(fifo.PriorityHeader)); on {
+				if err := swaputil.SetReqData(r.Context(), "priority", strconv.Itoa(p)); err != nil {
+					// The context has no Metadata map (e.g. /upstream path),
+					// so there is nothing to record — skip silently.
+				}
+			}
 			next.ServeHTTP(w, r)
 		})
 	}

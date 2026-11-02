@@ -558,6 +558,13 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
 	}
+	// Resolve the request-priority band here and on the server middleware
+	// (auth.go). Both read the same header via the same FifoConfig, so the
+	// scheduler key and the in-flight display key stay in lockstep.
+	fifo := b.config.Routing.Scheduler.Settings.Fifo
+	if p, on := fifo.ResolvePriority(req.Header.Get(fifo.PriorityHeader)); on {
+		hr.Priority = p
+	}
 
 	select {
 	case b.handlerCh <- hr:
