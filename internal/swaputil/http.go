@@ -134,6 +134,27 @@ func ClientContext(ctx context.Context) context.Context {
 	return ctx
 }
 
+// explicitModelKey marks a request context as an explicit /upstream/<model>/
+// target. Explicit requests must be served by the named model: the scheduler
+// never fuzzy-substitutes them onto another member of a swap group.
+type explicitModelKey struct{}
+
+// WithExplicitModel returns ctx carrying the explicit-target marker. It is set
+// by the server's /upstream handler so the scheduler treats the path-resolved
+// model as an explicit choice rather than a fuzzy candidate.
+func WithExplicitModel(ctx context.Context) context.Context {
+	return context.WithValue(ctx, explicitModelKey{}, true)
+}
+
+// IsExplicitModel reports whether ctx was marked by WithExplicitModel.
+func IsExplicitModel(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(explicitModelKey{}).(bool)
+	return v
+}
+
 // inflightIDKey carries the server's inflight entry ID through the request
 // context so the scheduler can tie a queued request back to its inflight row.
 type inflightIDKey struct{}

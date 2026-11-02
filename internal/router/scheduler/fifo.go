@@ -624,6 +624,11 @@ func (s *FIFO) effective(item queuedItem, now time.Time) int {
 // fuzzySubstitute rewrites a fuzzy-group request onto the group's online model
 // when fuzzy applies. Returns the (possibly rewritten) req.
 func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
+	// An explicit /upstream/<model>/ target must be served by the named model,
+	// never fuzzy-substituted onto another member of the group.
+	if req.Explicit {
+		return req
+	}
 	gid, ok := s.fuzzy.groupOf[req.Model]
 	if !ok {
 		return req
@@ -648,6 +653,12 @@ func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
 func (s *FIFO) maintenanceSubstitute(req HandlerReq) (HandlerReq, bool) {
 	if !s.effects.IsMaintenance(req.Model) {
 		return req, true
+	}
+	// An explicit /upstream/<model>/ target is never routed onto another model;
+	// a maintenance model cannot be started, so reject it here rather than
+	// starting a swap that is guaranteed to fail in doSwap.
+	if req.Explicit {
+		return req, false
 	}
 	gid, ok := s.fuzzy.groupOf[req.Model]
 	if !ok {
@@ -674,6 +685,13 @@ func (s *FIFO) protectPinned(req *HandlerReq, running, evict []string) (rewritte
 	for _, m := range evict {
 		if !s.effects.IsPinned(m) {
 			continue
+		}
+		// An explicit /upstream/<model>/ target is never rewritten onto the
+		// pinned model; reject so the client learns the target cannot be served.
+		if req.Explicit {
+			s.logger.Debugf("%s: rejecting explicit request for %s: would evict pinned model %s",
+				s.name, req.Model, m)
+			return false, swaputil.ErrPinnedProtected
 		}
 		if gid := s.fuzzy.groupOf[req.Model]; gid != "" && s.memberOf(m) == gid {
 			s.logger.Debugf("%s: protecting pinned model %s, serving it instead of %s (group %s)",

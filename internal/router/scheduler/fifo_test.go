@@ -1661,6 +1661,35 @@ func TestFIFO_Fuzzy_NonMemberUnaffected(t *testing.T) {
 	}
 }
 
+// TestFIFO_Fuzzy_ExplicitBypasses verifies an explicit /upstream/<model>/
+// request (HandlerReq.Explicit) is never fuzzy-substituted onto another group
+// member, even when the group is busy and fuzzy would otherwise apply.
+func TestFIFO_Fuzzy_ExplicitBypasses(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	s.OnRequest(reqMeta("a")) // group busy (a serving)
+
+	// Non-explicit b is fuzzed onto the online member a.
+	if got := s.fuzzySubstitute(reqMeta("b")); got.Model != "a" {
+		t.Errorf("non-explicit fuzzySubstitute(b) model=%q want a", got.Model)
+	}
+
+	// Explicit b is never rewritten.
+	explicit := reqMeta("b")
+	explicit.Explicit = true
+	got := s.fuzzySubstitute(explicit)
+	if got.Model != "b" {
+		t.Errorf("explicit fuzzySubstitute(b) model=%q want b (no rewrite)", got.Model)
+	}
+	if got.RequestedModel != "" {
+		t.Errorf("explicit fuzzySubstitute(b) RequestedModel=%q want empty", got.RequestedModel)
+	}
+}
+
 // TestFIFO_Fuzzy_GrantErrorNoMetadata verifies the grantError path (queued
 // request released on shutdown) writes no served_model/fifo_priority metadata.
 func TestFIFO_Fuzzy_GrantErrorNoMetadata(t *testing.T) {
@@ -1906,5 +1935,58 @@ func TestFIFO_DrainQueue_PinnedEvictRejects(t *testing.T) {
 	s.drainQueue()
 	if err := grantErrorFor(eff, "z"); !errors.Is(err, swaputil.ErrPinnedProtected) {
 		t.Fatalf("queued request err=%v want ErrPinnedProtected", err)
+	}
+}
+
+// TestFIFO_Maintenance_ExplicitRejects verifies an explicit /upstream/<model>/
+// request for a maintenance model is rejected with ErrMaintenance immediately
+// rather than starting a swap that is guaranteed to fail, and is never
+// substituted onto another member of the fuzzy group.
+func TestFIFO_Maintenance_ExplicitRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.maintenance["z"] = true
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "z": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	r := reqMeta("z")
+	r.Explicit = true
+	s.OnRequest(r)
+	if err := admitErr(t, r); !errors.Is(err, swaputil.ErrMaintenance) {
+		t.Fatalf("admit err=%v want ErrMaintenance", err)
+	}
+	if eff.served("a") != 0 {
+		t.Errorf("served(a)=%d want 0 (explicit z must not route to group member a)", eff.served("a"))
+	}
+	if eff.startsFor("z") != 0 {
+		t.Errorf("startSwap(z) called %d times, want 0", eff.startsFor("z"))
+	}
+}
+
+// TestFIFO_PinProtection_ExplicitRejects verifies an explicit /upstream/<model>/
+// request whose serving would evict a pinned model is rejected with
+// ErrPinnedProtected, and is never rewritten onto the pinned model even when
+// both models belong to the same fuzzy group.
+func TestFIFO_PinProtection_ExplicitRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.pinned["a"] = true
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "z": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFOFuzzy(planner, eff, gf, nil)
+
+	r := reqMeta("z")
+	r.Explicit = true
+	s.OnRequest(r)
+	if err := admitErr(t, r); !errors.Is(err, swaputil.ErrPinnedProtected) {
+		t.Fatalf("admit err=%v want ErrPinnedProtected", err)
+	}
+	if eff.served("a") != 0 {
+		t.Errorf("served(a)=%d want 0 (explicit z must not be rewritten to pinned a)", eff.served("a"))
+	}
+	if eff.startsFor("z") != 0 {
+		t.Errorf("startSwap(z) called %d times, want 0", eff.startsFor("z"))
 	}
 }

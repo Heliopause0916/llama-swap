@@ -135,6 +135,11 @@ type HandlerReq struct {
 	// fuzzy substitution rewrote Model to the group's online model. Empty when
 	// no rewrite happened. Display/metadata only — never a scheduling key.
 	RequestedModel string
+
+	// Explicit marks a request routed through /upstream/<model>/ as an explicit
+	// target. The scheduler must serve the named model and never fuzzy-substitute
+	// it onto another member of a swap group.
+	Explicit bool
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

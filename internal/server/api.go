@@ -517,8 +517,13 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 	escapedRemaining := swaputil.EscapedPathSuffix(r.URL.EscapedPath(), "/upstream/"+searchName)
 	r.URL.Path = remainingPath
 	r.URL.RawPath = escapedRemaining
-	// Pin the resolved model so the router skips body/query extraction.
-	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
+	// Pin the resolved model so the router skips body/query extraction, and mark
+	// it as an explicit target so the scheduler never fuzzy-substitutes it onto
+	// another member of a swap group (an /upstream/<model>/ request names the
+	// model to load/serve directly).
+	ctx := swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)})
+	ctx = swaputil.WithExplicitModel(ctx)
+	*r = *r.WithContext(ctx)
 
 	// If the path matches an upstream.ignorePaths entry and the model is
 	// not already loaded, refuse the request without triggering a swap. The

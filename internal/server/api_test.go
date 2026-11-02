@@ -242,6 +242,29 @@ func TestServer_HandleUpstream(t *testing.T) {
 	})
 }
 
+// TestServer_Upstream_SetsExplicitMarker verifies that handleUpstream marks the
+// resolved model as an explicit target on the request context, so the scheduler
+// will not fuzzy-substitute it onto another member of a swap group.
+func TestServer_Upstream_SetsExplicitMarker(t *testing.T) {
+	explicit := false
+	local := newStubRouter([]string{"m1"}, "ok")
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		explicit = swaputil.IsExplicitModel(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServerWithConfig(config.Config{Models: map[string]config.ModelConfig{"m1": {}}}, local, nil)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q want 200", w.Code, w.Body.String())
+	}
+	if !explicit {
+		t.Error("handleUpstream did not mark the request context as explicit")
+	}
+}
+
 // TestServer_HandleUpstreamRedirect_TrailingSlash covers the bare-model
 // trailing-slash redirect for names whose echoed form would break the
 // relative Location: slash names (a bare "author/model/" resolves against

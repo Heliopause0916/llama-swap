@@ -353,6 +353,25 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 			case <-b.shutdownCtx.Done():
 			}
 		}()
+
+		// Fuzzy substitution and alias resolution serve a model under a
+		// different name than the client sent: the forwarded model field
+		// would still name the request's original model, and a backend that
+		// validates model names would reject it (404 "model does not exist").
+		// When the serving process's model differs from the one the client
+		// asked for, rewrite the model wherever the request encodes it before
+		// forwarding (same shape as Peer.ServeHTTP). ReplaceRequestModel
+		// invalidates the cached request context, so restore the original ctx
+		// onto the rewritten request: the defer above and downstream
+		// bookkeeping read InflightID/metadata from it. A rewrite failure (e.g.
+		// unreadable or broken JSON) forwards the original request, logged.
+		if data, ok := swaputil.ReadContext(r.Context()); ok && data.Model != "" && data.Model != modelID {
+			if updated, err := swaputil.ReplaceRequestModel(r, data.Model, modelID); err == nil {
+				r = updated.WithContext(r.Context())
+			} else {
+				b.logger.Warnf("%s: could not rewrite model %q to %q: %v", b.name, data.Model, modelID, err)
+			}
+		}
 		p.ServeHTTP(w, r)
 	}
 }
@@ -674,6 +693,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
+		// An /upstream/<model>/ request names its target explicitly; the
+		// scheduler must not fuzzy-substitute it onto another group member.
+		Explicit: swaputil.IsExplicitModel(req.Context()),
 	}
 	// Resolve the request-priority band here and on the server middleware
 	// (auth.go). Both read the same header via the same FifoConfig, so the

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,6 +53,28 @@ func newTestBaseWithConfig(t *testing.T, conf config.Config, processes map[strin
 	if err != nil {
 		t.Fatalf("newBaseRouter: %v", err)
 	}
+	b.testProcessed = make(chan struct{}, 64)
+	go b.run()
+	t.Cleanup(func() {
+		if !b.shuttingDown.Load() {
+			_ = b.Shutdown(time.Second)
+		}
+	})
+	return b
+}
+
+// newTrackedServeBase builds a baseRouter whose scheduler ignores serve events,
+// so trackedServe can be driven directly without running a real admission (the
+// FIFO's OnServeDone would otherwise panic on a model that never held a
+// reservation). The scheduler is swapped before run() starts.
+func newTrackedServeBase(t *testing.T, processes map[string]process.Process) *baseRouter {
+	t.Helper()
+	b, err := newBaseRouter("test", config.Config{HealthCheckTimeout: 5}, processes,
+		logmon.NewWriter(io.Discard), &stubPlanner{})
+	if err != nil {
+		t.Fatalf("newBaseRouter: %v", err)
+	}
+	b.schedule = &captureScheduler{got: make(chan scheduler.HandlerReq, 1)}
 	b.testProcessed = make(chan struct{}, 64)
 	go b.run()
 	t.Cleanup(func() {
@@ -886,6 +909,241 @@ func (s *captureScheduler) OnUnload([]string, time.Duration)     {}
 func (s *captureScheduler) OnShutdown(error)                     {}
 func (s *captureScheduler) QueueSnapshot() []scheduler.QueueEntry {
 	return nil
+}
+
+// forwardingCapture wraps a fakeProcess and records the request it was asked to
+// serve: the raw body, the model the process would validate, and the context.
+// This is the exact point where a real backend checks the model name, so it is
+// where the forwarded-model rewrite (trackedServe) is observable.
+type forwardingCapture struct {
+	*fakeProcess
+	mu    sync.Mutex
+	model string
+	body  string
+	ctx   context.Context
+}
+
+func newForwardingCapture(id string) *forwardingCapture {
+	return &forwardingCapture{fakeProcess: newFakeProcess(id)}
+}
+
+func (c *forwardingCapture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	m, err := swaputil.ExtractModel(r)
+	if err != nil {
+		m = "<error: " + err.Error() + ">"
+	}
+	c.mu.Lock()
+	c.model = m
+	c.body = string(body)
+	c.ctx = r.Context()
+	c.mu.Unlock()
+	c.fakeProcess.ServeHTTP(w, r)
+}
+
+func (c *forwardingCapture) modelSeen(t *testing.T) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.model
+}
+
+func (c *forwardingCapture) bodySeen() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.body
+}
+
+func (c *forwardingCapture) contextSeen() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ctx
+}
+
+// TestBaseRouter_TrackedServe_RewritesForwardedModel verifies that when the
+// serving model differs from the one the client asked for (fuzzy substitution,
+// alias resolution), trackedServe rewrites the model field in the forwarded
+// request before it reaches the process — otherwise a strict backend rejects it
+// with "model does not exist". The capture lives in the process's ServeHTTP,
+// the same point where a real upstream would validate the model field.
+func TestBaseRouter_TrackedServe_RewritesForwardedModel(t *testing.T) {
+	capture := newForwardingCapture("a")
+	b := newTrackedServeBase(t, map[string]process.Process{"a": capture})
+
+	// The client asked for "b"; the scheduler handed the request to process
+	// "a" instead (a fuzzy rewrite decision that lives outside this test).
+	// The request that reaches the forwarding chain must carry model "a".
+	req := newRequest("b")
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{
+		Model:    "b",
+		ModelID:  "b",
+		Metadata: make(map[string]string),
+	}))
+	w := httptest.NewRecorder()
+	b.trackedServe("a", capture)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	if got := capture.modelSeen(t); got != "a" {
+		t.Fatalf("model in forwarded request = %q, want %q", got, "a")
+	}
+	// ReplaceRequestModel invalidates the cached request context; the rewritten
+	// request must keep the original one, since the defer and downstream
+	// bookkeeping read InflightID/metadata from it.
+	if _, ok := swaputil.ReadContext(capture.contextSeen()); !ok {
+		t.Error("request context data lost after model rewrite")
+	}
+}
+
+// TestBaseRouter_TrackedServe_NoRewriteWhenModelMatches verifies a direct send
+// (client asked for exactly the serving model) forwards the body verbatim.
+func TestBaseRouter_TrackedServe_NoRewriteWhenModelMatches(t *testing.T) {
+	capture := newForwardingCapture("a")
+	b := newTrackedServeBase(t, map[string]process.Process{"a": capture})
+
+	body := `{"model":"a","prompt":"hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{
+		Model:    "a",
+		ModelID:  "a",
+		Metadata: make(map[string]string),
+	}))
+	b.trackedServe("a", capture)(httptest.NewRecorder(), req)
+
+	if got := capture.modelSeen(t); got != "a" {
+		t.Fatalf("model in forwarded request = %q, want %q", got, "a")
+	}
+	if got := capture.bodySeen(); got != body {
+		t.Fatalf("forwarded body rewritten: %q, want original %q", got, body)
+	}
+}
+
+// fuzzyQwen and fuzzyAblit are the two members of the "qwen-forever" fuzzy group
+// used by the integration tests below. The group is configured with fuzzy: true
+// so a request for one member is served by the other when the group is busy or
+// recently served.
+const (
+	fuzzyQwen  = "Qwen3.8-27B"
+	fuzzyAblit = "Qwen3.8-27B-Abliterated"
+)
+
+// fuzzyGroupConfig builds the fuzzy swap group config shared by the Group-level
+// integration tests, mirroring a user's "Abliterated already started" state.
+func fuzzyGroupConfig() config.Config {
+	return config.Config{
+		HealthCheckTimeout: 5,
+		Routing: config.RoutingConfig{
+			Router: config.RouterConfig{
+				Use: "group",
+				Settings: config.RouterSettings{
+					Groups: map[string]config.GroupConfig{
+						"qwen-forever": {
+							Swap:       true,
+							Exclusive:  false,
+							Persistent: true,
+							Fuzzy:      true,
+							Members:    []string{fuzzyQwen, fuzzyAblit},
+						},
+					},
+				},
+			},
+		},
+		Models: map[string]config.ModelConfig{
+			fuzzyQwen:  {},
+			fuzzyAblit: {},
+		},
+	}
+}
+
+// TestGroup_Fuzzy_ForwardedModelRewritten drives the full Group.ServeHTTP path:
+// the scheduler fuzzy-substitutes a request for Qwen onto the loaded Abliterated,
+// and trackedServe must rewrite the forwarded model field to the actually-serving
+// model before it reaches the process. A backend that validates model names
+// strictly would otherwise reject the request with "model does not exist".
+func TestGroup_Fuzzy_ForwardedModelRewritten(t *testing.T) {
+	conf := fuzzyGroupConfig()
+	qwen := newFakeProcess(fuzzyQwen)
+	qwen.autoReady = true
+	ablit := newForwardingCapture(fuzzyAblit)
+	ablit.autoReady = true
+	ablit.markReady()
+
+	g := newTestGroup(t, conf, map[string]process.Process{fuzzyQwen: qwen, fuzzyAblit: ablit})
+
+	// Serve Abliterated once so the group is within its fuzzy idle window.
+	w1 := httptest.NewRecorder()
+	g.ServeHTTP(w1, newRequest(fuzzyAblit))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%q", w1.Code, w1.Body.String())
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Request Qwen: fuzzy substitutes it onto the loaded Abliterated.
+	w2 := httptest.NewRecorder()
+	g.ServeHTTP(w2, newRequest(fuzzyQwen))
+	t.Logf("status=%d body=%q", w2.Code, w2.Body.String())
+
+	if ablit.serveCalls.Load() != 2 {
+		t.Fatalf("ablit.serveCalls=%d want 2 (first Abliterated + fuzzed Qwen)", ablit.serveCalls.Load())
+	}
+	got := ablit.modelSeen(t)
+	t.Logf("forwarded model seen by process = %q", got)
+	if got != fuzzyAblit {
+		t.Errorf("forwarded model = %q, want %q (serving model); a strict backend would 404 'model does not exist'", got, fuzzyAblit)
+	}
+}
+
+// TestGroup_Upstream_ExplicitBypassesFuzzy drives the full Group.ServeHTTP path
+// with an explicit /upstream/<model>/ context marker: the scheduler must serve
+// the named Qwen (loading it and stopping Abliterated) rather than fuzzing the
+// request onto Abliterated, and never rewrite it onto another group member.
+func TestGroup_Upstream_ExplicitBypassesFuzzy(t *testing.T) {
+	conf := fuzzyGroupConfig()
+	qwen := newFakeProcess(fuzzyQwen)
+	qwen.autoReady = true
+	ablit := newForwardingCapture(fuzzyAblit)
+	ablit.autoReady = true
+	ablit.markReady()
+
+	g := newTestGroup(t, conf, map[string]process.Process{fuzzyQwen: qwen, fuzzyAblit: ablit})
+
+	w1 := httptest.NewRecorder()
+	g.ServeHTTP(w1, newRequest(fuzzyAblit))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%q", w1.Code, w1.Body.String())
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate handleUpstream for /upstream/Qwen3.8-27B/: strip prefix, set the
+	// context model and mark the target explicit, then local.ServeHTTP.
+	req := httptest.NewRequest(http.MethodGet, "/upstream/"+fuzzyQwen+"/", nil)
+	ctx := swaputil.SetContext(req.Context(), swaputil.ReqContextData{
+		Model:    fuzzyQwen,
+		ModelID:  fuzzyQwen,
+		Metadata: make(map[string]string),
+	})
+	req = req.WithContext(swaputil.WithExplicitModel(ctx))
+	w2 := httptest.NewRecorder()
+	g.ServeHTTP(w2, req)
+	t.Logf("status=%d body=%q", w2.Code, w2.Body.String())
+
+	// Explicit target: Qwen is loaded and served, not fuzzed onto Abliterated.
+	// Abliterated is stopped (same group, swap=true) and its serve count is
+	// unchanged by the /upstream request.
+	if ablit.serveCalls.Load() != 1 {
+		t.Errorf("ablit.serveCalls=%d want 1 (only the first request; /upstream must not fuzz onto Abliterated)", ablit.serveCalls.Load())
+	}
+	if qwen.runCalls.Load() == 0 {
+		t.Errorf("qwen.runCalls=%d want >0 (explicit /upstream must load Qwen3.8-27B)", qwen.runCalls.Load())
+	}
+	if w2.Body.String() != "ok:"+fuzzyQwen {
+		t.Errorf("served body=%q want %q (explicit target serves the real Qwen3.8-27B)", w2.Body.String(), "ok:"+fuzzyQwen)
+	}
 }
 
 // TestBaseRouter_IngressHeaderSnapshot drives the real ServeHTTP path and

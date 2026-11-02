@@ -92,9 +92,11 @@ routing:
 
 The online model's id is recorded in the `served_model` request metadata (the
 `Served` column in the activity table), so you can see what actually served the
-request. The request body is **not** rewritten: the upstream still receives the
-original model name. If an upstream validates `model` strictly, pair `fuzzy`
-with a filter or `useModelName` to rewrite the field for that upstream.
+request. The `model` field in the forwarded request (JSON body, query string, or
+`/upstream/<model>/` path) is rewritten to the actually-serving model before it
+reaches the backend, so a backend that validates `model` strictly still accepts
+the request. The client's request is never modified; the rewrite happens only at
+the forwarding chain.
 
 `fuzzy` needs `swap: true`, while spillover targets need a `swap: false` group,
 so the two cannot be combined on the same group. After a config reload the
