@@ -18,6 +18,8 @@
   import { groupModelsByClass, modelClassLabels } from "../lib/modelClasses";
   import type { Model } from "../lib/types";
   import ModelLoadButton from "../components/ModelLoadButton.svelte";
+  import ModelPinButton from "../components/ModelPinButton.svelte";
+  import ModelMaintenanceButton from "../components/ModelMaintenanceButton.svelte";
   import Tag from "../components/Tag.svelte";
   import * as Card from "$lib/components/ui/card/index.js";
   import { Button } from "$lib/components/ui/button/index.js";
@@ -165,6 +167,12 @@
         <ExternalLink class="size-4" />
       </a>
       <ModelLoadButton {model} />
+      {#if model.state === "ready"}
+        <ModelPinButton {model} />
+      {/if}
+      {#if model.state === "stopped"}
+        <ModelMaintenanceButton {model} />
+      {/if}
     {/if}
     {#if percent !== undefined}
       <!-- Loading progress; the percentage next to the state carries it for screen readers. -->

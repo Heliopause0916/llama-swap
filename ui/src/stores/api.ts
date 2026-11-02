@@ -456,6 +456,62 @@ export async function unloadSingleModel(model: string): Promise<void> {
   }
 }
 
+export async function pinModel(model: string): Promise<void> {
+  try {
+    const response = await fetch(apiUrl(`/api/models/pin/${model}`), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to pin model: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to pin model", model, error);
+    throw error;
+  }
+}
+
+export async function unpinModel(model: string): Promise<void> {
+  try {
+    const response = await fetch(apiUrl(`/api/models/unpin/${model}`), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to unpin model: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to unpin model", model, error);
+    throw error;
+  }
+}
+
+export async function enterMaintenance(model: string): Promise<void> {
+  try {
+    const response = await fetch(apiUrl(`/api/models/maintenance/${model}`), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to enter maintenance: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to enter maintenance", model, error);
+    throw error;
+  }
+}
+
+export async function exitMaintenance(model: string): Promise<void> {
+  try {
+    const response = await fetch(apiUrl(`/api/models/unmaintenance/${model}`), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to exit maintenance: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to exit maintenance", model, error);
+    throw error;
+  }
+}
+
 export async function cancelInflightRequest(id: string): Promise<void> {
   try {
     const response = await fetch(apiUrl(`/api/inflight/${encodeURIComponent(id)}/cancel`), {

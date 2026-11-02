@@ -49,6 +49,10 @@ export interface Model {
   strategy?: string;
   targets?: string[];
   spillover?: number;
+  // true while the model is pinned (never TTL-unloaded or evicted)
+  pinned?: boolean;
+  // true while the model is under maintenance (never started)
+  maintenance?: boolean;
 }
 
 export interface Profile {
