@@ -3,8 +3,8 @@ title: Running several models at once with groups, matrix and capacity
 summary: Choosing between group, matrix and capacity routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, capacity, concurrency, swap, vram, memory]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.capacity.pools, models.*.capacities, models.*.evict_cost]
-updated: 2026-10-22
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.groups.*.fuzzy, routing.router.settings.groups.*.fuzzyIdleTimeout, routing.router.settings.matrix, routing.router.settings.capacity.pools, routing.scheduler.settings.fifo.requestPriority, routing.scheduler.settings.fifo.defaultPriority, routing.scheduler.settings.fifo.priorityHeader, routing.scheduler.settings.fifo.queueDepth, routing.scheduler.settings.fifo.queueTimeout, routing.scheduler.settings.fifo.promoteAfter, models.*.capacities, models.*.evict_cost]
+updated: 2026-11-02
 ---
 
 # Running several models at once: groups, matrix and capacity
@@ -61,6 +61,45 @@ ID.
 
 The classic setup is one exclusive group for the big LLMs and one non-exclusive
 group for small always-useful models like embeddings and rerankers.
+
+## Fuzzy substitution (`fuzzy`)
+
+A swap group normally switches to whatever member a request names. `fuzzy`
+lets an online member answer requests for a *different* member instead of
+swapping, so a busy group keeps serving without churning the model in VRAM.
+
+`fuzzy` requires `swap: true` and is off by default. When it is on, a request
+for a member that is not the online model is served by whichever member is
+online, as long as the group is busy — or, when idle, within the idle window
+set by `fuzzyIdleTimeout`:
+
+- `fuzzyIdleTimeout` omitted → a 300s window
+- `fuzzyIdleTimeout: 0` → fuzzy only while the group is busy
+- `fuzzyIdleTimeout: N` → fuzzy for N seconds after the last request was served
+
+```yaml
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        main:
+          swap: true
+          fuzzy: true
+          fuzzyIdleTimeout: 120
+          members: [llama, qwen]
+```
+
+The online model's id is recorded in the `served_model` request metadata (the
+`Served` column in the activity table), so you can see what actually served the
+request. The request body is **not** rewritten: the upstream still receives the
+original model name. If an upstream validates `model` strictly, pair `fuzzy`
+with a filter or `useModelName` to rewrite the field for that upstream.
+
+`fuzzy` needs `swap: true`, while spillover targets need a `swap: false` group,
+so the two cannot be combined on the same group. After a config reload the
+scheduler is rebuilt and the group's "last served" time is reset, so the first
+request to an idle fuzzy group may trigger a real switch before fuzzy resumes.
 
 ## `matrix` — more work, far more flexible
 
@@ -264,7 +303,9 @@ valid and maintaining explicit matrix combinations would be tedious.
 
 ## Request ordering
 
-Queued requests are FIFO. You can give some models priority:
+Queued requests are FIFO by default. The `fifo` scheduler can also order them
+by a request header priority band, and can queue requests that arrive over a
+model's concurrency limit.
 
 ```yaml
 routing:
@@ -272,12 +313,34 @@ routing:
     use: fifo
     settings:
       fifo:
-        priority:
-          interactive-model: 10
-          batch-model: 1
+        priorityHeader: "X-Request-Priority"
+        requestPriority:
+          high: 100
+          medium: 60
+          low: 30
+        defaultPriority: 60
+        queueDepth: 10
+        queueTimeout: 60
+        promoteAfter: 30
 ```
 
-Higher numbers are serviced first. Models default to 0.
+The request-priority feature is off until `requestPriority` is a non-empty map
+and `priorityHeader` is non-empty. When it is on, each request's band is read
+from the `priorityHeader` request header, mapped through `requestPriority` to a
+number, and higher numbers are serviced first. A missing header or an unknown
+band name falls back to `defaultPriority`. Set `priorityHeader` to an empty
+string for pure FIFO.
+
+Queueing applies only when a model is already serving at its concurrency limit.
+`queueDepth` is how many extra requests may wait (default 10; set it to 0 to
+disable queueing so over-limit requests get the upstream 429). `queueTimeout`
+is how long a queued request waits before it is dropped with
+`429 + Retry-After: 1` (default 60s; 0 waits forever).
+
+A steady stream of high-priority requests can starve low-priority ones.
+`promoteAfter` pins any queued request older than the threshold to the top tier
+at the next drain, guaranteeing low-priority requests make progress. It
+defaults to off (0) and must be smaller than the effective `queueTimeout`.
 
 ## Related
 
