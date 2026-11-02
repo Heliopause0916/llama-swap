@@ -202,6 +202,7 @@ groups:
 			{"svr-path", "path/to/server"},
 		},
 		SendLoadingState: false,
+		Audit:            AuditConfig{},
 		UnloadTimeout:    DEFAULT_UNLOAD_TIMEOUT,
 		MaxRequestBodyMB: DEFAULT_MAX_REQUEST_BODY_MB,
 		Models: map[string]ModelConfig{

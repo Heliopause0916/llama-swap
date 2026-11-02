@@ -190,6 +190,16 @@ type UIActivityConfig struct {
 	SessionID []string `yaml:"session_id" json:"session_id"`
 }
 
+// AuditConfig controls optional request audit snapshots recorded into the
+// activity log metadata.
+type AuditConfig struct {
+	// RequestHeaders enables snapshotting the six ingress request headers
+	// (User-Agent, X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto,
+	// X-Real-Ip, X-Request-Priority) into the activity record metadata under
+	// their snake_case keys. Optional, default false (disabled).
+	RequestHeaders bool `yaml:"requestHeaders" json:"requestHeaders"`
+}
+
 // HelpAgentConfig controls the UI's Help page and the /api/mcp endpoint that
 // serves its tools.
 type HelpAgentConfig struct {
@@ -223,6 +233,7 @@ type Config struct {
 	Tailcat            *TailcatConfig    `yaml:"tailcat"`
 	HealthCheckTimeout int               `yaml:"healthCheckTimeout"`
 	LogRequests        bool              `yaml:"logRequests"`
+	Audit              AuditConfig       `yaml:"audit"`
 	LogLevel           string            `yaml:"logLevel"`
 	LogTimeFormat      string            `yaml:"logTimeFormat"`
 	LogToStdout        string            `yaml:"logToStdout"`

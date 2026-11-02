@@ -3,8 +3,8 @@ title: Observability, storage and Activity
 summary: Use logs, metrics, captures and the Activity view to diagnose requests and retain useful history.
 category: guides
 tags: [operations, logs, metrics, activity, captures, stdout, http]
-config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer, store.path, store.persistCaptures]
-updated: 2026-10-31
+config_keys: [logLevel, logToStdout, metricsMaxInMemory, captureBuffer, store.path, store.persistCaptures, audit.requestHeaders]
+updated: 2026-11-02
 ---
 
 # Observability, storage and Activity
@@ -82,3 +82,29 @@ What goes wrong:
 
 Do not put secrets in captures or debug logs. Reduce retention after diagnosing
 an issue.
+
+## Recording ingress request headers
+
+`audit.requestHeaders` snapshots six ingress request headers into each activity
+row's metadata under snake_case keys, for auditing who called the proxy:
+
+```yaml
+audit:
+  requestHeaders: true
+```
+
+The recorded keys are `user_agent`, `x_forwarded_for`, `x_forwarded_host`,
+`x_forwarded_proto`, `x_real_ip` and `x_request_priority`, with the values
+recorded as transmitted. A missing or empty header writes no key.
+
+What goes wrong:
+
+- `x_request_priority` is read from the configured
+  `routing.scheduler.settings.fifo.priorityHeader`, not a fixed header name. If
+  you customize `priorityHeader`, the snapshot follows it; a value on the
+  literal `X-Request-Priority` is ignored. With `priorityHeader` empty (the
+  priority feature off) no `x_request_priority` key is written.
+- `X-Forwarded-For` and `X-Real-Ip` are forgeable proxy-chain values and are
+  not a trusted client identity.
+- The snapshot runs only when `audit.requestHeaders` is `true`; with the
+  default (`false`) no ingress header keys are written.

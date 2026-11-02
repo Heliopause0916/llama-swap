@@ -2,6 +2,9 @@ healthCheckTimeout: 300
 logRequests: true
 metricsMaxInMemory: 1000
 
+# audit:
+#   requestHeaders: true  # snapshot the 6 ingress request headers into activity records (optional, default: off)
+
 models:
   "qwen2.5":
     proxy: "http://127.0.0.1:9999"

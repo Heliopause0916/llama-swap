@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -554,6 +555,16 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Snapshot the ingress request headers into the request metadata before
+	// any dispatch decision: ServeHTTP is the one place that sees both the
+	// raw *http.Request and the context's metadata map. The captured values
+	// ride along with the request-priority metadata into the activity record.
+	// Opt-in via audit.requestHeaders (default off); when disabled no
+	// snapshot keys are written.
+	if b.config.Audit.RequestHeaders {
+		snapshotIngressHeaders(req.Context(), req, b.config.Routing.Scheduler.Settings.Fifo.PriorityHeader)
+	}
+
 	// Ignored websocket connections are deliberately kept outside the
 	// scheduler: they cannot start or queue a model, consume concurrency, or
 	// prevent another request from swapping the process out. A process may stop
@@ -705,4 +716,62 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	resp.HandleFunc(w, req)
+}
+
+// ingressHeaderSnapshots is the header→metadata-key mapping stamped at
+// ingress. Keys use the snake_case style of the existing metadata bag
+// (fifo_priority, priority, selector). The x_request_priority entry is
+// special: it follows the configured fifo.priorityHeader rather than a fixed
+// literal, so the snapshot captures the same header the scheduler resolves
+// (Header.Get first-value semantics). When priorityHeader is empty (priority
+// feature off) no x_request_priority key is written. Absent header ⇒ no key.
+// X-Forwarded-For is the one multi-value header: HTTP/1.1 may transmit it on
+// several same-name lines, so every line must be joined into the snapshot to
+// keep the full proxy chain (see the join flag).
+var ingressHeaderSnapshots = []struct {
+	header string
+	key    string
+	// join reads every header line and concatenates it with ", " instead of
+	// taking only the first (Header.Get). Only X-Forwarded-For needs it:
+	// multi-line same-name delivery is legal for it and dropping later hops
+	// would lose audit evidence.
+	join bool
+	// priority marks the entry whose header name is the configured
+	// fifo.PriorityHeader (overriding the static `header` field at snapshot
+	// time), keeping the audit key aligned with the scheduler's resolution.
+	priority bool
+}{
+	{"User-Agent", "user_agent", false, false},
+	{"X-Forwarded-For", "x_forwarded_for", true, false},
+	{"X-Forwarded-Host", "x_forwarded_host", false, false},
+	{"X-Forwarded-Proto", "x_forwarded_proto", false, false},
+	{"X-Real-Ip", "x_real_ip", false, false},
+	{"X-Request-Priority", "x_request_priority", false, true},
+}
+
+// snapshotIngressHeaders copies the raw ingress request headers into the
+// request context's metadata map. Values are recorded verbatim as transmitted:
+// a single-line X-Forwarded-For comma chain stays intact, and a multi-line
+// X-Forwarded-For (HTTP/1.1 allows the same name repeated) is joined line by
+// line with ", " so no hop is dropped. X-Forwarded-For and X-Real-Ip are
+// forgeable proxy-chain values and must not be treated as a trusted client
+// identity; they are captured for auditing. The x_request_priority entry reads
+// priorityHeader (the configured fifo.priorityHeader), not a fixed literal, so
+// it matches the header the scheduler resolves. A missing or empty header
+// writes no key, matching the "absent ⇒ no key" convention of the existing
+// metadata.
+func snapshotIngressHeaders(ctx context.Context, r *http.Request, priorityHeader string) {
+	for _, h := range ingressHeaderSnapshots {
+		header := h.header
+		if h.priority {
+			header = priorityHeader
+		}
+		v := r.Header.Get(header)
+		if h.join {
+			v = strings.Join(r.Header.Values(header), ", ")
+		}
+		if v != "" {
+			_ = swaputil.SetReqData(ctx, h.key, v)
+		}
+	}
 }
