@@ -116,6 +116,17 @@ type GroupConfig struct {
 	Exclusive  bool     `yaml:"exclusive"`
 	Persistent bool     `yaml:"persistent"`
 	Members    []string `yaml:"members"`
+
+	// Fuzzy enables fuzzy substitution within a swap group: while the group is
+	// busy (or within FuzzyIdleTimeout of its last served request), requests for
+	// a different member are served by the online model without switching.
+	// Requires swap: true (validated at load).
+	Fuzzy bool `yaml:"fuzzy"`
+
+	// FuzzyIdleTimeout is the idle window (seconds) during which an idle fuzzy
+	// group keeps serving with its online model. nil -> 300; 0 -> fuzzy only
+	// while busy; <0 -> load error. Resolved in the scheduler at construction.
+	FuzzyIdleTimeout *int `yaml:"fuzzyIdleTimeout"`
 }
 
 // set default values for GroupConfig
@@ -319,7 +330,70 @@ type SchedulerSettings struct {
 }
 
 type FifoConfig struct {
-	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// PriorityHeader names the request header carrying the priority band.
+	// Empty means the feature is off (pure FIFO).
+	PriorityHeader string `yaml:"priorityHeader"`
+
+	// RequestPriority maps a header band name to a numeric priority. Empty
+	// means the request-priority feature is off (all requests default to 0,
+	// no priority metadata is written).
+	RequestPriority map[string]int `yaml:"requestPriority"`
+
+	// DefaultPriority is the band used when the header is absent or names an
+	// unknown band. Only consulted when RequestPriority is non-empty.
+	DefaultPriority int `yaml:"defaultPriority"`
+
+	// QueueDepth is the per-model queue capacity beyond the concurrency limit.
+	// nil -> 10; 0 -> queueing off (over-limit requests get 429 upstream);
+	// >0 -> that many requests may queue.
+	QueueDepth *int `yaml:"queueDepth"`
+
+	// QueueTimeout is the maximum wait a queued request tolerates before it is
+	// dropped with 429 + Retry-After: 1. nil -> 60s; 0 -> infinite; >0 -> seconds.
+	QueueTimeout *int `yaml:"queueTimeout"`
+
+	// PromoteAfter is the L1.5 aging threshold: a queued request older than
+	// this is pinned to the internal top tier at the next drain. nil/0 -> off.
+	PromoteAfter *int `yaml:"promoteAfter"`
+
+	// legacyPriority records that the removed model-level 'priority' key was
+	// present in the YAML. load.go warns and ignores it (D14 compat).
+	legacyPriority bool
+}
+
+// UnmarshalYAML detects the removed model-level 'priority' key so load.go can
+// warn and ignore it, while decoding the current fields as usual.
+func (c *FifoConfig) UnmarshalYAML(value *yaml.Node) error {
+	type legacyFifo struct {
+		Priority map[string]int `yaml:"priority"`
+	}
+	var legacy legacyFifo
+	if err := value.Decode(&legacy); err != nil {
+		return err
+	}
+	hasLegacy := legacy.Priority != nil
+	type rawFifo FifoConfig
+	var raw rawFifo
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*c = FifoConfig(raw)
+	c.legacyPriority = hasLegacy
+	return nil
+}
+
+// ResolvePriority maps a header value to a numeric band. on is false when the
+// request-priority feature is off (RequestPriority empty or PriorityHeader
+// empty, i.e. pure FIFO), in which case the returned priority is 0 and no
+// 'priority' metadata key should be written.
+func (c FifoConfig) ResolvePriority(headerValue string) (priority int, on bool) {
+	if len(c.RequestPriority) == 0 || c.PriorityHeader == "" {
+		return 0, false
+	}
+	if v, ok := c.RequestPriority[headerValue]; ok {
+		return v, true
+	}
+	return c.DefaultPriority, true
 }
 
 type RouterConfig struct {

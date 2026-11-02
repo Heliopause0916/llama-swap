@@ -157,7 +157,7 @@ func (f *fakeEffects) startsFor(modelID string) int {
 }
 
 func newFIFO(planner Swapper, eff Effects) *FIFO {
-	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff)
+	return NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff, groupFuzzy{})
 }
 
 func req(model string) HandlerReq {
@@ -174,6 +174,53 @@ func reqCh(model string) HandlerReq {
 	r := req(model)
 	r.Respond = make(chan HandlerResp, 1)
 	return r
+}
+
+// reqP creates a HandlerReq carrying a resolved priority band.
+func reqP(model string, priority int) HandlerReq {
+	r := req(model)
+	r.Priority = priority
+	return r
+}
+
+// reqMeta creates a HandlerReq whose context carries a request metadata map, so
+// tests can assert on the metadata keys the scheduler writes at grant time.
+func reqMeta(model string) HandlerReq {
+	r := req(model)
+	r.Ctx = swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: model, Metadata: make(map[string]string)})
+	return r
+}
+
+// fakeClock is a controllable clock used to drive aging/fuzzy idle-window tests.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// newFIFOWithClock builds a FIFO from the given config/models and injects the
+// supplied clock. Passing a nil clock leaves time.Now in place.
+func newFIFOWithClock(planner Swapper, eff Effects, cfg config.FifoConfig, models map[string]config.ModelConfig, clock *fakeClock) *FIFO {
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, models, eff, groupFuzzy{})
+	if clock != nil {
+		s.now = clock.now
+	}
+	return s
+}
+
+// newFIFOAging builds a FIFO (no fuzzy groups) with an injectable clock, for
+// L1.5 aging tests.
+func newFIFOAging(planner Swapper, eff Effects, cfg config.FifoConfig, clock *fakeClock) *FIFO {
+	return newFIFOWithClock(planner, eff, cfg, nil, clock)
+}
+
+// newFIFOFuzzy builds a FIFO with a fuzzy group snapshot and an injectable
+// clock, for theme-A fuzzy tests.
+func newFIFOFuzzy(planner Swapper, eff Effects, gf groupFuzzy, clock *fakeClock) *FIFO {
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, nil, eff, gf)
+	if clock != nil {
+		s.now = clock.now
+	}
+	return s
 }
 
 func admitErr(t *testing.T, req HandlerReq) error {
@@ -265,11 +312,10 @@ func TestFIFO_FastPath(t *testing.T) {
 func TestFIFO_GrantSetsPriorityMetadata(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateReady
-	cfg := config.FifoConfig{Priority: map[string]int{"a": 7}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, nil, eff)
+	s := newFIFO(&stubPlanner{}, eff)
 
 	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: "a", Metadata: make(map[string]string)})
-	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx})
+	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx, Priority: 7})
 
 	if got := eff.served("a"); got != 1 {
 		t.Fatalf("served(a)=%d want 1", got)
@@ -678,9 +724,10 @@ func TestFIFO_OnUnload_DropsQueuedRequests(t *testing.T) {
 	}
 }
 
-// TestFIFO_PriorityQueueOrder verifies queued requests are ordered by descending
-// priority, with arrival (FIFO) order preserved among equal-priority models.
-func TestFIFO_PriorityQueueOrder(t *testing.T) {
+// TestFIFO_Queue_EnqueueOrderByPriority verifies queued requests are ordered by
+// descending priority, with arrival (FIFO) order preserved among equal-priority
+// models.
+func TestFIFO_Queue_EnqueueOrderByPriority(t *testing.T) {
 	eff := newFakeEffects()
 	for _, m := range []string{"z", "A", "B", "C", "D"} {
 		eff.states[m] = process.StateStopped
@@ -688,19 +735,20 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 	// z's swap evicts every other model, so any request that arrives while z is
 	// loading collides with z's in-flight swap and parks in the queue.
 	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
-	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
+	s := newFIFO(planner, eff)
 
 	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D])
 
 	// Arrive out of priority order; B before C exercises FIFO tie-breaking.
-	for _, m := range []string{"B", "D", "C", "A"} {
-		s.OnRequest(req(m))
+	for _, r := range []HandlerReq{
+		reqP("B", 5), reqP("D", 1), reqP("C", 5), reqP("A", 10),
+	} {
+		s.OnRequest(r)
 	}
 
 	got := make([]string, len(s.queued))
 	for i, q := range s.queued {
-		got[i] = q.Model
+		got[i] = q.Req.Model
 	}
 	want := []string{"A", "B", "C", "D"}
 	if len(got) != len(want) {
@@ -801,7 +849,9 @@ func TestFIFO_OnCancel_NotPresent(t *testing.T) {
 }
 
 // newFIFOWithLimit builds a FIFO whose single model has the given concurrency
-// limit, already in StateReady so every request exercises the fast path.
+// limit, already in StateReady so every request exercises the fast path. It
+// disables queueing (queueDepth=0) so over-limit requests are rejected at
+// admission, isolating the concurrency-limit semantics under test.
 func newFIFOWithLimit(t *testing.T, model string, limit int) (*FIFO, *fakeEffects) {
 	t.Helper()
 	eff := newFakeEffects()
@@ -809,7 +859,9 @@ func newFIFOWithLimit(t *testing.T, model string, limit int) (*FIFO, *fakeEffect
 	models := map[string]config.ModelConfig{
 		model: {ConcurrencyLimit: limit},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	qd := 0
+	cfg := config.FifoConfig{QueueDepth: &qd}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, cfg, models, eff, groupFuzzy{})
 	return s, eff
 }
 
@@ -851,7 +903,9 @@ func TestFIFO_ConcurrencyLimit_DefaultIsTen(t *testing.T) {
 	eff := newFakeEffects()
 	eff.states["a"] = process.StateReady
 	// nil models → every model gets defaultConcurrencyLimit (10).
-	s := newFIFO(&stubPlanner{}, eff)
+	// queueDepth=0 keeps over-limit rejection at admission so the cap is observable.
+	qd := 0
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, nil, eff, groupFuzzy{})
 
 	for i := 0; i < 10; i++ {
 		r := req("a")
@@ -903,7 +957,8 @@ func TestFIFO_ConcurrencyLimit_SwapWaiters(t *testing.T) {
 	models := map[string]config.ModelConfig{
 		"a": {ConcurrencyLimit: 2},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
+	qd := 0
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
 
 	// Three requests arrive while model is loading: one starts swap, two join.
 	r1 := req("a")
@@ -943,7 +998,8 @@ func TestFIFO_ConcurrencyLimit_QueuedWaitersReserveCapacity(t *testing.T) {
 		"a": {ConcurrencyLimit: 2},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	qd := 0
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
 
 	bReq := req("b")
 	aReq1 := req("a")
@@ -989,7 +1045,8 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		"a": {ConcurrencyLimit: 1},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	qd := 0
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
 
 	bReq := req("b")
 	cancelledReq := reqCh("a")
@@ -1009,5 +1066,615 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 
 	if got := len(s.queued); got != 1 {
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
+	}
+}
+
+// TestFIFO_Priority_HeaderResolved verifies the header→band→default chain via
+// ResolvePriority, and that a granted request carries the resolved band in the
+// fifo_priority metadata key.
+func TestFIFO_Priority_HeaderResolved(t *testing.T) {
+	cfg := config.FifoConfig{
+		PriorityHeader:  "X-Request-Priority",
+		RequestPriority: map[string]int{"high": 100, "low": 30},
+		DefaultPriority: 60,
+	}
+	if p, on := cfg.ResolvePriority("high"); !on || p != 100 {
+		t.Errorf("ResolvePriority(high)=%d,%v want 100,true", p, on)
+	}
+	if p, on := cfg.ResolvePriority("bogus"); !on || p != 60 {
+		t.Errorf("ResolvePriority(bogus)=%d,%v want 60,true (unknown band -> default)", p, on)
+	}
+	if p, on := cfg.ResolvePriority(""); !on || p != 60 {
+		t.Errorf("ResolvePriority('')=%d,%v want 60,true (absent header -> default)", p, on)
+	}
+
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: "a", Metadata: make(map[string]string)})
+	p, _ := cfg.ResolvePriority("high")
+	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx, Priority: p})
+	data, ok := swaputil.ReadContext(eff.lastServeReq.Ctx)
+	if !ok {
+		t.Fatal("context data missing from granted request")
+	}
+	if data.Metadata["fifo_priority"] != "100" {
+		t.Errorf("fifo_priority=%q want 100", data.Metadata["fifo_priority"])
+	}
+}
+
+// TestFIFO_Priority_FeatureOff verifies that with RequestPriority empty the
+// feature is off: ResolvePriority reports off and a granted request carries
+// fifo_priority=0.
+func TestFIFO_Priority_FeatureOff(t *testing.T) {
+	cfg := config.FifoConfig{}
+	if p, on := cfg.ResolvePriority("high"); on || p != 0 {
+		t.Errorf("ResolvePriority(high)=%d,%v want 0,false when feature off", p, on)
+	}
+
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFO(&stubPlanner{}, eff)
+	ctx := swaputil.SetContext(context.Background(), swaputil.ReqContextData{ModelID: "a", Metadata: make(map[string]string)})
+	s.OnRequest(HandlerReq{Model: "a", Ctx: ctx}) // Priority defaults to 0
+	data, ok := swaputil.ReadContext(eff.lastServeReq.Ctx)
+	if !ok {
+		t.Fatal("context data missing from granted request")
+	}
+	if data.Metadata["fifo_priority"] != "0" {
+		t.Errorf("fifo_priority=%q want 0", data.Metadata["fifo_priority"])
+	}
+}
+
+// TestFIFO_Priority_EmptyHeaderDisables verifies that a non-empty RequestPriority
+// with an empty PriorityHeader keeps the feature off (pure FIFO): every request
+// would otherwise read the empty header and silently fall to defaultPriority,
+// contradicting "empty header = pure FIFO".
+func TestFIFO_Priority_EmptyHeaderDisables(t *testing.T) {
+	cfg := config.FifoConfig{
+		RequestPriority: map[string]int{"high": 100},
+		DefaultPriority: 60,
+	}
+	if p, on := cfg.ResolvePriority("high"); on || p != 0 {
+		t.Errorf("ResolvePriority(high)=%d,%v want 0,false with empty PriorityHeader", p, on)
+	}
+	if p, on := cfg.ResolvePriority(""); on || p != 0 {
+		t.Errorf("ResolvePriority('')=%d,%v want 0,false with empty PriorityHeader", p, on)
+	}
+}
+
+// TestFIFO_Queue_AdmitQueueDepth verifies the admission bound: with queueDepth=n
+// a request is rejected only when reserved >= limit+n, and with queueDepth=0 it
+// is rejected as soon as reserved >= limit.
+func TestFIFO_Queue_AdmitQueueDepth(t *testing.T) {
+	// queueDepth=3: limit 2 + 3 = 5 reserved allowed; the 6th is rejected.
+	{
+		eff := newFakeEffects()
+		eff.states["a"] = process.StateReady
+		qd := 3
+		models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+		s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
+		for i := 0; i < 5; i++ {
+			r := req("a")
+			s.OnRequest(r)
+			assertAdmitted(t, r)
+		}
+		r := req("a")
+		s.OnRequest(r)
+		assertAdmission429(t, r)
+		if got := eff.errored("a"); got != 0 {
+			t.Fatalf("errored(a)=%d want 0 (over queue depth rejects before grant)", got)
+		}
+	}
+	// queueDepth=0: limit 2, the 3rd is rejected at admission.
+	{
+		eff := newFakeEffects()
+		eff.states["a"] = process.StateReady
+		qd := 0
+		models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+		s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
+		s.OnRequest(req("a"))
+		s.OnRequest(req("a"))
+		r := req("a")
+		s.OnRequest(r)
+		assertAdmission429(t, r)
+	}
+}
+
+// TestFIFO_Queue_CapacityGateInFlight verifies drainQueue does not grant a
+// queued request whose model is already at its serving limit, and preserves the
+// item's EnqueuedAt (D19 continuous aging).
+func TestFIFO_Queue_CapacityGateInFlight(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	qd := 10
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
+
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	if eff.served("a") != 1 {
+		t.Fatalf("served(a)=%d want 1", eff.served("a"))
+	}
+
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1 (capacity gate)", len(s.queued))
+	}
+	before := s.queued[0].EnqueuedAt
+
+	// drain while a is still in flight: r2 must stay queued, not granted.
+	s.drainQueue()
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1 after drain while in-flight", len(s.queued))
+	}
+	if s.queued[0].EnqueuedAt != before {
+		t.Errorf("EnqueuedAt changed: %v -> %v", before, s.queued[0].EnqueuedAt)
+	}
+	if eff.served("a") != 1 {
+		t.Errorf("served(a)=%d want 1 (queued request not granted)", eff.served("a"))
+	}
+}
+
+// TestFIFO_Queue_CapacityGateSlotRelease verifies that releasing a single
+// serving slot (limit>1) drains the queue: a request parked by the capacity
+// gate is granted as soon as inFlight drops below the limit, without waiting for
+// the model to become fully idle. With limit=1 the old drain-on-idle trigger
+// masked this, but with limit=2 a partial release would starve the queued item.
+func TestFIFO_Queue_CapacityGateSlotRelease(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	qd := 10
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 2}}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{QueueDepth: &qd}, models, eff, groupFuzzy{})
+
+	r1 := req("a")
+	s.OnRequest(r1)
+	assertAdmitted(t, r1)
+	r2 := req("a")
+	s.OnRequest(r2)
+	assertAdmitted(t, r2)
+	if eff.served("a") != 2 {
+		t.Fatalf("served(a)=%d want 2 (two slots filled)", eff.served("a"))
+	}
+
+	// Third request is parked by the capacity gate (inFlight[a]=2 == limit).
+	r3 := req("a")
+	s.OnRequest(r3)
+	assertAdmitted(t, r3)
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1 (capacity gate at limit 2)", len(s.queued))
+	}
+
+	// Release one slot: inFlight drops 2->1 (< limit), so the queued request
+	// must be granted immediately rather than waiting for the model to go idle.
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if eff.served("a") != 3 {
+		t.Fatalf("served(a)=%d want 3 after slot release drains queue", eff.served("a"))
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue len=%d want 0 after slot release", len(s.queued))
+	}
+}
+
+// TestFIFO_Queue_TimeoutPrune verifies an item past its queueTimeout deadline
+// is dropped with a 429 on drain.
+func TestFIFO_Queue_TimeoutPrune(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	qd := 10
+	qt := 5
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	cfg := config.FifoConfig{QueueDepth: &qd, QueueTimeout: &qt}
+	s := newFIFOWithClock(&stubPlanner{}, eff, cfg, models, clock)
+
+	s.OnRequest(req("a")) // served -> inFlight[a]=1
+	r2 := req("a")
+	s.OnRequest(r2) // queued via capacity gate at t0
+	assertAdmitted(t, r2)
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1", len(s.queued))
+	}
+	deadline := s.queued[0].Deadline
+
+	clock.t = deadline.Add(time.Second)
+	s.drainQueue()
+
+	if eff.errored("a") != 1 {
+		t.Fatalf("errored(a)=%d want 1 (expired item dropped with 429)", eff.errored("a"))
+	}
+	if len(s.queued) != 0 {
+		t.Fatalf("queue len=%d want 0 after prune", len(s.queued))
+	}
+}
+
+// TestFIFO_Aging_PromotesAfterThreshold verifies an item older than promoteAfter
+// is pinned to the internal top tier at drain and jumps ahead of a younger
+// higher-priority item.
+func TestFIFO_Aging_PromotesAfterThreshold(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	pa := 10
+	cfg := config.FifoConfig{PromoteAfter: &pa}
+	s := newFIFOAging(&stubPlanner{}, eff, cfg, clock)
+
+	a := reqP("a", 1)
+	b := reqP("b", 100)
+	s.enqueue(a) // at t0, age will be 20s
+	clock.advance(15 * time.Second)
+	s.enqueue(b)                   // at t0+15s, age 5s
+	clock.advance(5 * time.Second) // t0+20s
+
+	if s.queued[0].Req.Model != "b" {
+		t.Fatalf("queue[0]=%s want b before drain", s.queued[0].Req.Model)
+	}
+
+	s.drainQueue()
+
+	if len(eff.grants) < 2 || eff.grants[0].model != "a" || !eff.grants[0].serve {
+		t.Fatalf("first grant=%+v want serve a (promoted)", eff.grants[0])
+	}
+	if eff.grants[1].model != "b" || !eff.grants[1].serve {
+		t.Fatalf("second grant=%+v want serve b", eff.grants[1])
+	}
+}
+
+// TestFIFO_Aging_FeatureOffNil verifies that with promoteAfter unset, drainQueue
+// performs no re-rank (baseline L1 behavior).
+func TestFIFO_Aging_FeatureOffNil(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	s := newFIFOAging(&stubPlanner{}, eff, config.FifoConfig{}, clock)
+
+	s.enqueue(reqP("a", 1)) // t0
+	clock.advance(15 * time.Second)
+	s.enqueue(reqP("b", 100))      // t0+15
+	clock.advance(5 * time.Second) // t0+20
+
+	if s.queued[0].Req.Model != "b" {
+		t.Fatalf("queue[0]=%s want b", s.queued[0].Req.Model)
+	}
+	s.drainQueue()
+	if len(eff.grants) < 2 || eff.grants[0].model != "b" {
+		t.Fatalf("first grant=%+v want serve b (no aging)", eff.grants[0])
+	}
+}
+
+// TestFIFO_Aging_FeatureOffZero verifies that promoteAfter=0 behaves like the
+// feature being off (no re-rank).
+func TestFIFO_Aging_FeatureOffZero(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	pa := 0
+	cfg := config.FifoConfig{PromoteAfter: &pa}
+	s := newFIFOAging(&stubPlanner{}, eff, cfg, clock)
+
+	s.enqueue(reqP("a", 1)) // t0
+	clock.advance(15 * time.Second)
+	s.enqueue(reqP("b", 100))      // t0+15
+	clock.advance(5 * time.Second) // t0+20
+
+	if s.queued[0].Req.Model != "b" {
+		t.Fatalf("queue[0]=%s want b", s.queued[0].Req.Model)
+	}
+	s.drainQueue()
+	if len(eff.grants) < 2 || eff.grants[0].model != "b" {
+		t.Fatalf("first grant=%+v want serve b (promoteAfter=0)", eff.grants[0])
+	}
+}
+
+// TestFIFO_Aging_ClockBoundary verifies the promotion threshold is inclusive:
+// age exactly equal to promoteAfter promotes, slightly less does not.
+func TestFIFO_Aging_ClockBoundary(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	pa := 10
+	cfg := config.FifoConfig{PromoteAfter: &pa}
+	s := newFIFOAging(&stubPlanner{}, newFakeEffects(), cfg, clock)
+
+	item := queuedItem{Req: reqP("a", 1), EnqueuedAt: time.Unix(0, 0)}
+
+	clock.t = time.Unix(0, 0).Add(10 * time.Second)
+	if got := s.effective(item, clock.t); got != promotedPriority {
+		t.Errorf("effective at age==threshold=%d want promotedPriority", got)
+	}
+	clock.t = time.Unix(0, 0).Add(9 * time.Second)
+	if got := s.effective(item, clock.t); got != 1 {
+		t.Errorf("effective at age<threshold=%d want 1", got)
+	}
+}
+
+// TestFIFO_Fuzzy_DisabledByDefault verifies that with no fuzzy groups configured
+// (empty groupFuzzy) requests are never rewritten.
+func TestFIFO_Fuzzy_DisabledByDefault(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	s := newFIFOFuzzy(&stubPlanner{}, eff, groupFuzzy{}, nil)
+
+	r := reqMeta("a")
+	s.OnRequest(r)
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("served model=%q want a (no fuzzy)", eff.lastServeReq.Model)
+	}
+	if eff.lastServeReq.RequestedModel != "" {
+		t.Errorf("RequestedModel=%q want empty", eff.lastServeReq.RequestedModel)
+	}
+}
+
+// TestFIFO_Fuzzy_BusyServes verifies that a request for a member is rewritten to
+// the online model while the group is busy, and that served_model metadata is
+// written on grant.
+func TestFIFO_Fuzzy_BusyServes(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	s.OnRequest(reqMeta("a")) // a serving -> group busy
+	r := reqMeta("b")
+	s.OnRequest(r)
+
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("served model=%q want a (fuzzed)", eff.lastServeReq.Model)
+	}
+	if eff.lastServeReq.RequestedModel != "b" {
+		t.Errorf("RequestedModel=%q want b", eff.lastServeReq.RequestedModel)
+	}
+	data, _ := swaputil.ReadContext(eff.lastServeReq.Ctx)
+	if data.Metadata["served_model"] != "a" {
+		t.Errorf("served_model=%q want a", data.Metadata["served_model"])
+	}
+}
+
+// TestFIFO_Fuzzy_ActiveSwapTargetWins verifies fuzzyOnline prefers the in-flight
+// swap target of the group over running members.
+func TestFIFO_Fuzzy_ActiveSwapTargetWins(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	s.OnRequest(req("b")) // startSwap(b) -> active swap target b
+	r := reqMeta("a")
+	s.OnRequest(r) // a fuzzed to b and joins b's swap
+
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1", eff.startsFor("b"))
+	}
+	sw := s.active["b"]
+	if sw == nil || len(sw.waiters) != 2 {
+		t.Fatalf("active[b] waiters=%d want 2 (b's own request + fuzzed a)", len(sw.waiters))
+	}
+	joined := false
+	for _, w := range sw.waiters {
+		if w.RequestedModel == "a" {
+			joined = true
+		}
+	}
+	if !joined {
+		t.Error("a did not join b's swap as a fuzzed waiter")
+	}
+}
+
+// TestFIFO_Fuzzy_IdleWithinWindow verifies that an idle group that has served
+// before fuzzes a request for a different member within the idle window.
+func TestFIFO_Fuzzy_IdleWithinWindow(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, clock)
+
+	s.OnRequest(reqMeta("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // idle, lastServeDone[g]=t0
+	clock.advance(100 * time.Second)            // within 300s window
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("served model=%q want a (idle within window)", eff.lastServeReq.Model)
+	}
+}
+
+// TestFIFO_Fuzzy_NeverServed verifies an idle group that has never served does
+// not fuzz (real switch).
+func TestFIFO_Fuzzy_NeverServed(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, clock)
+
+	r := reqMeta("b")
+	s.OnRequest(r)
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("StartSwap(b)=%d want 1 (no fuzzy, real switch)", eff.startsFor("b"))
+	}
+	if s.active["b"] == nil {
+		t.Fatal("no active swap for b")
+	}
+}
+
+// TestFIFO_Fuzzy_ZeroTimeoutOnlyWhenBusy verifies that an idleTimeout of 0
+// disables fuzzy when the group is idle but keeps it while busy.
+func TestFIFO_Fuzzy_ZeroTimeoutOnlyWhenBusy(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 0}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, clock)
+
+	// Busy: a serving -> b fuzzed to a.
+	s.OnRequest(reqMeta("a"))
+	r := reqMeta("b")
+	s.OnRequest(r)
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("busy: served model=%q want a", eff.lastServeReq.Model)
+	}
+
+	// Idle: a finishes (both a's own and the fuzzed-b serves drain); timeout 0
+	// -> b not fuzzed (real switch).
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	r2 := reqMeta("b")
+	s.OnRequest(r2)
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("idle: StartSwap(b)=%d want 1 (timeout 0 => no fuzzy when idle)", eff.startsFor("b"))
+	}
+}
+
+// TestFIFO_Fuzzy_ServeDoneRefreshesWindow verifies OnServeDone refreshes the
+// group's lastServeDone timestamp.
+func TestFIFO_Fuzzy_ServeDoneRefreshesWindow(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, clock)
+
+	s.OnRequest(reqMeta("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // lastServeDone[g]=t0
+	clock.advance(100 * time.Second)
+	s.OnRequest(reqMeta("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // lastServeDone[g]=t0+100
+
+	if s.lastServeDone["g"] != clock.t {
+		t.Errorf("lastServeDone[g]=%v want %v (refreshed)", s.lastServeDone["g"], clock.t)
+	}
+}
+
+// TestFIFO_Fuzzy_CancelDoesNotRefresh verifies cancelling a queued request does
+// not update the group's lastServeDone window.
+func TestFIFO_Fuzzy_CancelDoesNotRefresh(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFOFuzzy(planner, eff, gf, clock)
+
+	s.OnRequest(reqMeta("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // idle within window
+	s.OnRequest(req("z"))                       // startSwap(z), evicts a
+
+	br := reqCh("b") // fuzzed to a, collides with z's swap -> queued (admitted)
+	s.OnRequest(br)
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1", len(s.queued))
+	}
+	got := s.lastServeDone["g"]
+
+	s.OnCancel(br)
+
+	if s.lastServeDone["g"] != got {
+		t.Errorf("lastServeDone[g]=%v want %v (cancel must not refresh)", s.lastServeDone["g"], got)
+	}
+}
+
+// TestFIFO_Fuzzy_BookkeepingKeysUseRewrittenModel verifies the scheduler keys
+// (reserved/inFlight) use the rewritten model, not the original requested one.
+func TestFIFO_Fuzzy_BookkeepingKeysUseRewrittenModel(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	s.OnRequest(reqMeta("a")) // a serving
+	r := reqMeta("b")
+	s.OnRequest(r) // b fuzzed to a
+
+	if s.inFlight["a"] != 2 {
+		t.Errorf("inFlight[a]=%d want 2", s.inFlight["a"])
+	}
+	if _, ok := s.inFlight["b"]; ok {
+		t.Error("inFlight has key b (should be a)")
+	}
+	if s.reserved["a"] != 2 || s.reserved["b"] != 0 {
+		t.Errorf("reserved a=%d b=%d want 2/0", s.reserved["a"], s.reserved["b"])
+	}
+}
+
+// TestFIFO_Fuzzy_MultipleRunningPrefersReady verifies fuzzyOnline prefers a
+// Ready group member over a running-but-not-ready one.
+func TestFIFO_Fuzzy_MultipleRunningPrefersReady(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStarting // running but not ready
+	eff.states["b"] = process.StateReady
+	eff.states["c"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g", "c": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	s.OnRequest(reqMeta("b")) // b serving -> group busy
+	r := reqMeta("c")
+	s.OnRequest(r)
+
+	if eff.lastServeReq.Model != "b" {
+		t.Errorf("served model=%q want b (Ready preferred over starting a)", eff.lastServeReq.Model)
+	}
+}
+
+// TestFIFO_Fuzzy_NonMemberUnaffected verifies a model outside every fuzzy group
+// is never rewritten.
+func TestFIFO_Fuzzy_NonMemberUnaffected(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["x"] = process.StateReady
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	r := reqMeta("x")
+	s.OnRequest(r)
+	if eff.lastServeReq.Model != "x" {
+		t.Errorf("served model=%q want x (not a member)", eff.lastServeReq.Model)
+	}
+	if eff.lastServeReq.RequestedModel != "" {
+		t.Errorf("RequestedModel=%q want empty", eff.lastServeReq.RequestedModel)
+	}
+}
+
+// TestFIFO_Fuzzy_GrantErrorNoMetadata verifies the grantError path (queued
+// request released on shutdown) writes no served_model/fifo_priority metadata.
+func TestFIFO_Fuzzy_GrantErrorNoMetadata(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "b": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFOFuzzy(planner, eff, gf, clock)
+
+	s.OnRequest(reqMeta("a"))
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // within window, idle
+	s.OnRequest(req("z"))                       // startSwap(z), evicts a
+
+	r := reqMeta("b") // fuzzed to a, collides with z's swap -> queued
+	s.OnRequest(r)
+	if len(s.queued) != 1 {
+		t.Fatalf("queue len=%d want 1", len(s.queued))
+	}
+
+	s.OnShutdown(errors.New("shutting down"))
+
+	data, ok := swaputil.ReadContext(r.Ctx)
+	if !ok {
+		t.Fatal("no context data")
+	}
+	if _, has := data.Metadata["served_model"]; has {
+		t.Error("served_model should not be written on grantError")
+	}
+	if _, has := data.Metadata["fifo_priority"]; has {
+		t.Error("fifo_priority should not be written on grantError")
 	}
 }

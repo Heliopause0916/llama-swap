@@ -104,7 +104,8 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 	}
 	switch use {
 	case "fifo":
-		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo, conf.Models, eff), nil
+		return NewFIFO(name, logger, planner, conf.Routing.Scheduler.Settings.Fifo,
+			conf.Models, eff, newGroupFuzzy(conf)), nil
 	default:
 		return nil, fmt.Errorf("unsupported scheduler type: %q", use)
 	}
@@ -117,6 +118,15 @@ type HandlerReq struct {
 	Admit      chan error
 	Respond    chan HandlerResp
 	PositionCh chan int
+
+	// Priority is the resolved request band (requestPriority/defaultPriority).
+	// 0 when the request-priority feature is off (RequestPriority empty).
+	Priority int
+
+	// RequestedModel records the model the client actually asked for when the
+	// fuzzy substitution rewrote Model to the group's online model. Empty when
+	// no rewrite happened. Display/metadata only — never a scheduling key.
+	RequestedModel string
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

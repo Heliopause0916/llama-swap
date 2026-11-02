@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfig_SanitizeCommand(t *testing.T) {
@@ -69,6 +70,8 @@ models:
 		assert.Equal(t, true, defaultGroup.Swap)
 		assert.Equal(t, true, defaultGroup.Exclusive)
 		assert.Equal(t, false, defaultGroup.Persistent)
+		assert.Equal(t, false, defaultGroup.Fuzzy)
+		assert.Nil(t, defaultGroup.FuzzyIdleTimeout)
 		assert.Equal(t, []string{"model1"}, defaultGroup.Members)
 	}
 
@@ -179,9 +182,11 @@ groups:
 
 	expectedGroups := map[string]GroupConfig{
 		DEFAULT_GROUP_ID: {
-			Swap:      true,
-			Exclusive: true,
-			Members:   []string{"model1", "model3"},
+			Swap:             true,
+			Exclusive:        true,
+			Members:          []string{"model1", "model3"},
+			Fuzzy:            false,
+			FuzzyIdleTimeout: nil,
 		},
 		"group1": {
 			Swap:      true,
@@ -307,4 +312,44 @@ groups:
 	realname, found := config.RealModelName("m1")
 	assert.True(t, found)
 	assert.Equal(t, "model1", realname)
+}
+
+func TestConfig_Fuzzy_FieldsParse(t *testing.T) {
+	content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+  model2:
+    cmd: server --port ${PORT}
+groups:
+  g1:
+    swap: true
+    fuzzy: true
+    fuzzyIdleTimeout: 42
+    members: ["model1", "model2"]
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+	g, ok := cfg.Groups["g1"]
+	require.True(t, ok)
+	assert.True(t, g.Fuzzy)
+	require.NotNil(t, g.FuzzyIdleTimeout)
+	assert.Equal(t, 42, *g.FuzzyIdleTimeout)
+}
+
+func TestConfig_Routing_FifoPriorityDeprecatedWarns(t *testing.T) {
+	content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+routing:
+  scheduler:
+    settings:
+      fifo:
+        priority:
+          model1: 10
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+	assert.True(t, cfg.Routing.Scheduler.Settings.Fifo.legacyPriority)
 }

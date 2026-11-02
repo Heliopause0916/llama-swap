@@ -1996,21 +1996,10 @@ routing:
 	assert.Contains(t, err.Error(), "unknown router")
 }
 
-func TestConfig_Routing_FifoPriorityUnknownModel(t *testing.T) {
-	yaml := twoModels + `
-routing:
-  scheduler:
-    settings:
-      fifo:
-        priority:
-          nope: 5
-`
-	_, err := LoadConfigFromReader(strings.NewReader(yaml))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unknown model")
-}
-
-func TestConfig_Routing_FifoPriorityKnownModel(t *testing.T) {
+func TestConfig_Routing_FifoPriorityDeprecatedIgnored(t *testing.T) {
+	// The model-level 'priority' key is deprecated and ignored (D14). Loading
+	// a config that still carries it must not fail; the legacy flag is set so
+	// load.go can warn, and the new request-priority fields stay untouched.
 	yaml := twoModels + `
 routing:
   scheduler:
@@ -2021,5 +2010,126 @@ routing:
 `
 	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
 	require.NoError(t, err)
-	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
+	assert.True(t, cfg.Routing.Scheduler.Settings.Fifo.legacyPriority)
+	assert.Nil(t, cfg.Routing.Scheduler.Settings.Fifo.RequestPriority)
+}
+
+func TestConfig_PromoteAfter_NegativeRejected(t *testing.T) {
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        promoteAfter: -1
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "promoteAfter must be >= 0")
+}
+
+func TestConfig_PromoteAfter_NilAndZeroAccepted(t *testing.T) {
+	// nil (unset) is accepted.
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        queueTimeout: 60
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.Routing.Scheduler.Settings.Fifo.PromoteAfter)
+
+	// 0 disables promotion and is accepted.
+	yaml = twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        promoteAfter: 0
+`
+	cfg, err = LoadConfigFromReader(strings.NewReader(yaml))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Routing.Scheduler.Settings.Fifo.PromoteAfter)
+	assert.Equal(t, 0, *cfg.Routing.Scheduler.Settings.Fifo.PromoteAfter)
+}
+
+func TestConfig_PromoteAfter_D20ConflictRejected(t *testing.T) {
+	// Effective queueTimeout defaults to 60s; promoteAfter must be strictly less.
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        promoteAfter: 60
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "queueTimeout (60s) must be > promoteAfter (60s)")
+
+	// An explicit queueTimeout equal to promoteAfter also conflicts.
+	yaml = twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        queueTimeout: 30
+        promoteAfter: 30
+`
+	_, err = LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "queueTimeout (30s) must be > promoteAfter (30s)")
+}
+
+func TestConfig_PromoteAfter_BandCappedRejected(t *testing.T) {
+	// requestPriority band must be < P_max (2147483647).
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        requestPriority:
+          high: 2147483647
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `requestPriority["high"]: value 2147483647 must be < 2147483647`)
+
+	// defaultPriority must also be < P_max.
+	yaml = twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        defaultPriority: 2147483647
+`
+	_, err = LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "defaultPriority: value 2147483647 must be < 2147483647")
+}
+
+func TestLoad_FuzzyRequiresSwap(t *testing.T) {
+	yaml := twoModels + `
+groups:
+  g1:
+    swap: false
+    fuzzy: true
+    members: [gemma, qwen]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group g1: fuzzy requires swap: true")
+}
+
+func TestLoad_FuzzyIdleTimeoutNegative(t *testing.T) {
+	yaml := twoModels + `
+groups:
+  g1:
+    fuzzy: true
+    fuzzyIdleTimeout: -5
+    members: [gemma, qwen]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "group g1: fuzzyIdleTimeout must be >= 0")
 }

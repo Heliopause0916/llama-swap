@@ -113,6 +113,17 @@
                             "type": "string"
                         },
                         "description": "Array of model IDs that are members of this group. Model IDs must be defined in models."
+                    },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Enables fuzzy substitution within a swap group: while the group is busy (or within fuzzyIdleTimeout of its last served request), requests for a different member are served by the online model without switching. Requires swap: true."
+                    },
+                    "fuzzyIdleTimeout": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 300,
+                        "description": "Idle window (seconds) during which an idle fuzzy group keeps serving with its online model. nil -> 300; 0 -> fuzzy only while busy."
                     }
                 }
             },
@@ -1001,12 +1012,37 @@
                                 "fifo": {
                                     "type": "object",
                                     "properties": {
-                                        "priority": {
+                                        "priorityHeader": {
+                                            "type": "string",
+                                            "description": "Request header name carrying the priority band. Empty means the feature is off (pure FIFO)."
+                                        },
+                                        "requestPriority": {
                                             "type": "object",
-                                            "description": "Per-model priority. Keys are model IDs, values are integers (default 0). Higher values are serviced first.",
+                                            "description": "Maps a header band name to a numeric priority. Empty means the request-priority feature is off (all requests default to 0, no priority metadata is written).",
                                             "additionalProperties": {
-                                                "type": "integer"
+                                                "type": "integer",
+                                                "minimum": 0
                                             }
+                                        },
+                                        "defaultPriority": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "description": "Band used when the header is absent or names an unknown band. Only consulted when requestPriority is non-empty."
+                                        },
+                                        "queueDepth": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "description": "Per-model queue capacity beyond the concurrency limit. nil -> 10; 0 -> queueing off (over-limit requests get 429 upstream); >0 -> that many requests may queue."
+                                        },
+                                        "queueTimeout": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "description": "Maximum wait a queued request tolerates before it is dropped with 429 + Retry-After: 1. nil -> 60s; 0 -> infinite; >0 -> seconds."
+                                        },
+                                        "promoteAfter": {
+                                            "type": "integer",
+                                            "minimum": 0,
+                                            "description": "Aging threshold: a queued request older than this is pinned to the internal top tier at the next drain. nil/0 -> off."
                                         }
                                     },
                                     "additionalProperties": false

@@ -16,6 +16,9 @@ import (
 // the model config leaves concurrencyLimit unset.
 const defaultConcurrencyLimit = 10
 
+// promotedPriority is the internal top tier (D17), strictly above every band.
+const promotedPriority = 2147483647 // math.MaxInt32
+
 // activeSwap tracks one in-flight swap and the callers waiting on it.
 type activeSwap struct {
 	modelID    string
@@ -23,6 +26,15 @@ type activeSwap struct {
 	cancel     func()
 	evict      []string
 	waiters    []HandlerReq
+}
+
+// queuedItem is one entry in the global queue. Deadline is the queueTimeout
+// bound (zero when queueTimeout is infinite); EnqueuedAt is the promotion
+// clock (D16) written once at enqueue and never reset (D19).
+type queuedItem struct {
+	Req        HandlerReq
+	Deadline   time.Time
+	EnqueuedAt time.Time
 }
 
 // FIFO is the default scheduler. Requests are handled in a first-in, first-out order.
@@ -45,15 +57,23 @@ type FIFO struct {
 	active   map[string]*activeSwap
 	reserved map[string]int
 	inFlight map[string]int
-	queued   []HandlerReq
+	queued   []queuedItem
 
 	nextGeneration uint64
+
+	queueDepth    int                  // 解析后的队列容量（0 = 关闭排队）
+	queueTimeout  time.Duration        // 解析后的超时（0 = 无限）
+	promoteAfter  time.Duration        // 解析后的老化阈值（0 = 关闭）
+	now           func() time.Time     // 可注入时钟（D23），默认 time.Now
+	fuzzy         groupFuzzy           // 构造期 fuzzy 配置快照
+	lastServeDone map[string]time.Time // groupID -> 最后一次服务完成时刻；缺失 = 从未服务
 }
 
 // NewFIFO builds a FIFO scheduler. Per-model concurrency limits are derived
 // from models: each model's ConcurrencyLimit overrides defaultConcurrencyLimit
-// when set to a value greater than zero.
-func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
+// when set to a value greater than zero. fuzzy is the construction-time snapshot
+// of fuzzy-enabled swap groups (empty/inert when no fuzzy groups are configured).
+func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects, fuzzy groupFuzzy) *FIFO {
 	limits := make(map[string]int, len(models))
 	for id, mc := range models {
 		limit := defaultConcurrencyLimit
@@ -63,16 +83,39 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		limits[id] = limit
 	}
 
+	qd := 10 // nil default
+	if cfg.QueueDepth != nil {
+		qd = *cfg.QueueDepth
+	}
+	qt := 60 * time.Second // nil default
+	if cfg.QueueTimeout != nil {
+		if *cfg.QueueTimeout == 0 {
+			qt = 0
+		} else {
+			qt = time.Duration(*cfg.QueueTimeout) * time.Second
+		}
+	}
+	pa := time.Duration(0)
+	if cfg.PromoteAfter != nil && *cfg.PromoteAfter > 0 {
+		pa = time.Duration(*cfg.PromoteAfter) * time.Second
+	}
+
 	return &FIFO{
-		name:     name,
-		logger:   logger,
-		planner:  planner,
-		cfg:      cfg,
-		effects:  eff,
-		limits:   limits,
-		active:   make(map[string]*activeSwap),
-		reserved: make(map[string]int),
-		inFlight: make(map[string]int),
+		name:          name,
+		logger:        logger,
+		planner:       planner,
+		cfg:           cfg,
+		effects:       eff,
+		limits:        limits,
+		active:        make(map[string]*activeSwap),
+		reserved:      make(map[string]int),
+		inFlight:      make(map[string]int),
+		queueDepth:    qd,
+		queueTimeout:  qt,
+		promoteAfter:  pa,
+		now:           time.Now,
+		fuzzy:         fuzzy,
+		lastServeDone: make(map[string]time.Time),
 	}
 }
 
@@ -96,6 +139,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //  6. Otherwise — start a new swap. This may run in parallel with other active
 //     swaps when their evict sets don't intersect.
 func (s *FIFO) OnRequest(req HandlerReq) {
+	// (0) Fuzzy rewrite — before ALL bookkeeping (admit/reserved/inFlight/queued/active).
+	req = s.fuzzySubstitute(req)
+
 	// (1) Unknown model.
 	state, ok := s.effects.ModelState(req.Model)
 	if !ok {
@@ -105,6 +151,14 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	}
 
 	if !s.admit(req) {
+		return
+	}
+
+	// (1b) Serving-capacity gate: if the model is already serving at its limit,
+	// enqueue rather than serve/swap (queueDepth enabled path).
+	if s.inFlight[req.Model] >= s.limit(req.Model) {
+		s.logger.Debugf("%s: model %s at concurrency limit, enqueueing", s.name, req.Model)
+		s.enqueue(req)
 		return
 	}
 
@@ -156,9 +210,9 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, q := range s.queued {
-			if q.Respond == req.Respond {
+			if q.Req.Respond == req.Respond {
 				removed = true
-				s.release(q.Model)
+				s.release(q.Req.Model)
 				continue
 			}
 			kept = append(kept, q)
@@ -209,14 +263,24 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	s.drainQueue()
 }
 
-// OnServeDone decrements the per-model in-flight count and, when that drops to
-// zero, retries the queue: requests whose swap was deferred because they would
-// have evicted this (now-idle) process can now proceed.
+// OnServeDone decrements the per-model in-flight count and, when a serving slot
+// frees up (inFlight < limit), retries the queue: requests parked by the
+// capacity gate (inFlight >= limit) can now proceed, as can requests whose swap
+// was deferred because they would have evicted a busy process. Draining on every
+// slot release (not only when the model goes fully idle) prevents starvation and
+// priority inversion when limit > 1.
 func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
+	if gid := s.memberOf(ev.ModelID); gid != "" {
+		s.lastServeDone[gid] = s.now()
+	}
 	s.inFlight[ev.ModelID]--
 	s.release(ev.ModelID)
 	if s.inFlight[ev.ModelID] <= 0 {
 		delete(s.inFlight, ev.ModelID)
+	}
+	// After delete, the missing-key read yields 0, which is < any limit, so a
+	// fully-idle model still drains. A partial release (limit-1) also drains.
+	if s.inFlight[ev.ModelID] < s.limit(ev.ModelID) {
 		s.drainQueue()
 	}
 }
@@ -251,8 +315,8 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	if len(s.queued) > 0 {
 		kept := s.queued[:0]
 		for _, w := range s.queued {
-			if targetSet[w.Model] {
-				s.grantError(w, unloadErr)
+			if targetSet[w.Req.Model] {
+				s.grantError(w.Req, unloadErr)
 				continue
 			}
 			kept = append(kept, w)
@@ -280,7 +344,7 @@ func (s *FIFO) OnShutdown(err error) {
 		}
 	}
 	for _, w := range s.queued {
-		s.grantError(w, err)
+		s.grantError(w.Req, err)
 	}
 }
 
@@ -290,8 +354,13 @@ func (s *FIFO) OnShutdown(err error) {
 // Concurrency-limit rejection happens earlier in admit, before a request can
 // start the loading stream.
 func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
-	if err := swaputil.SetReqData(req.Ctx, "fifo_priority", strconv.Itoa(s.cfg.Priority[req.Model])); err != nil {
+	if err := swaputil.SetReqData(req.Ctx, "fifo_priority", strconv.Itoa(req.Priority)); err != nil {
 		s.logger.Debugf("failed to set fifo_priority metadata: %v", err)
+	}
+	if req.RequestedModel != "" && req.RequestedModel != modelID {
+		if err := swaputil.SetReqData(req.Ctx, "served_model", modelID); err != nil {
+			s.logger.Debugf("failed to set served_model metadata: %v", err)
+		}
 	}
 
 	if s.effects.GrantServe(req, modelID) {
@@ -308,11 +377,12 @@ func (s *FIFO) grantError(req HandlerReq, err error) {
 	s.effects.GrantError(req, err)
 }
 
-// admit performs the pre-stream admission handshake. Accepted requests reserve
-// one future serving slot until they serve, cancel while waiting, or receive a
-// post-admission error.
+// admit reserves one future serving slot. When the model is at its serving
+// limit and queueing is enabled (queueDepth > 0), the request is admitted and
+// will be enqueued by OnRequest/drainQueue; when the queue is full
+// (reserved >= limit + queueDepth) or queueing is off, it is rejected 429.
 func (s *FIFO) admit(req HandlerReq) bool {
-	if s.reserved[req.Model] >= s.limit(req.Model) {
+	if s.reserved[req.Model] >= s.limit(req.Model)+s.queueDepth {
 		s.rejectAdmission(req, swaputil.ConcurrencyLimitError{})
 		return false
 	}
@@ -390,19 +460,26 @@ func (s *FIFO) startSwap(initial HandlerReq, evict, running []string) {
 // enqueue inserts req into the queue in priority order: it goes just before the
 // first queued item whose priority is strictly lower, so higher-priority models
 // are serviced first while equal-priority requests keep their arrival (FIFO)
-// order. Priorities come from the FifoConfig; unlisted models default to 0.
+// order. Priority is the resolved request band (req.Priority); it is a
+// scheduling key only, never a model-config lookup.
 func (s *FIFO) enqueue(req HandlerReq) {
-	p := s.cfg.Priority[req.Model]
+	now := s.now()
+	var deadline time.Time
+	if s.queueTimeout > 0 {
+		deadline = now.Add(s.queueTimeout)
+	}
+	item := queuedItem{Req: req, Deadline: deadline, EnqueuedAt: now}
+	p := req.Priority
 	i := len(s.queued)
 	for j, q := range s.queued {
-		if s.cfg.Priority[q.Model] < p {
+		if q.Req.Priority < p {
 			i = j
 			break
 		}
 	}
-	s.queued = append(s.queued, HandlerReq{})
+	s.queued = append(s.queued, queuedItem{})
 	copy(s.queued[i+1:], s.queued[i:])
-	s.queued[i] = req
+	s.queued[i] = item
 	broadcastQueuePositions(s.queued)
 }
 
@@ -414,12 +491,34 @@ func (s *FIFO) drainQueue() {
 	if len(s.queued) == 0 {
 		return
 	}
+	// Capture the clock once so the re-rank comparator and the timeout prune use
+	// a single, consistent timestamp. Calling s.now() per item against a real
+	// clock could make the comparator non-transitive at a threshold boundary.
+	now := s.now()
+	// L1.5: stable re-rank by effective priority (desc), zero cost when off.
+	if s.promoteAfter > 0 {
+		sort.SliceStable(s.queued, func(i, j int) bool {
+			return s.effective(s.queued[i], now) > s.effective(s.queued[j], now)
+		})
+	}
 	pending := s.queued
-	var remaining []HandlerReq
-	for _, req := range pending {
+	var remaining []queuedItem
+	for _, item := range pending {
+		req := item.Req
+		// Lazy queueTimeout prune: past deadline -> 429 + Retry-After: 1.
+		if s.queueTimeout > 0 && now.After(item.Deadline) {
+			s.grantError(req, swaputil.ConcurrencyLimitError{})
+			continue
+		}
 		state, ok := s.effects.ModelState(req.Model)
 		if !ok {
 			s.grantError(req, ErrModelNotFound)
+			continue
+		}
+		// In-flight capacity gate (inFlight >= limit): keep queued (D19 keeps
+		// EnqueuedAt). This is the deadlock-free form.
+		if s.inFlight[req.Model] >= s.limit(req.Model) {
+			remaining = append(remaining, item)
 			continue
 		}
 		if sw, ok := s.active[req.Model]; ok {
@@ -435,11 +534,11 @@ func (s *FIFO) drainQueue() {
 			continue
 		}
 		if collidesWith(req.Model, evict, s.active) {
-			remaining = append(remaining, req)
+			remaining = append(remaining, item)
 			continue
 		}
 		if conflictsWithInFlight(evict, s.inFlight) {
-			remaining = append(remaining, req)
+			remaining = append(remaining, item)
 			continue
 		}
 		s.logger.Debugf("%s: queued request for model %s now starting swap, evicting %v", s.name, req.Model, evict)
@@ -448,6 +547,122 @@ func (s *FIFO) drainQueue() {
 	s.queued = remaining
 	broadcastQueuePositions(s.queued)
 }
+
+// effective returns the aging-adjusted scheduling priority (D18). now is the
+// drain-time clock snapshot, captured once so the sort comparator stays
+// transitive. Pinned items ride the exclusive top tier; promotion is
+// scheduler-internal only (D22).
+func (s *FIFO) effective(item queuedItem, now time.Time) int {
+	if s.promoteAfter > 0 && now.Sub(item.EnqueuedAt) >= s.promoteAfter {
+		return promotedPriority
+	}
+	return item.Req.Priority
+}
+
+// fuzzySubstitute rewrites a fuzzy-group request onto the group's online model
+// when fuzzy applies. Returns the (possibly rewritten) req.
+func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
+	gid, ok := s.fuzzy.groupOf[req.Model]
+	if !ok {
+		return req
+	}
+	served := s.fuzzyOnline(gid)
+	if served == "" || served == req.Model {
+		return req
+	}
+	if !s.fuzzyApplies(gid) {
+		return req
+	}
+	s.logger.Debugf("%s: fuzzy serving %s with online model %s (group %s)", s.name, req.Model, served, gid)
+	req.RequestedModel = req.Model
+	req.Model = served
+	return req
+}
+
+// fuzzyOnline returns the model an incoming request would be fuzzed onto: the
+// in-flight swap target first (the direction the group is already switching),
+// else a running group member — preferring a Ready one, then lexicographically
+// first for determinism. "" when the group has neither.
+func (s *FIFO) fuzzyOnline(gid string) string {
+	// 1) in-flight swap targets belonging to gid (at most one colliding swap,
+	//    but collect+sort for determinism).
+	var targets []string
+	for target := range s.active {
+		if s.memberOf(target) == gid {
+			targets = append(targets, target)
+		}
+	}
+	if len(targets) > 0 {
+		sort.Strings(targets)
+		return targets[0]
+	}
+	// 2) running members, preferring Ready.
+	var ready, others []string
+	for m, st := range s.effects.RunningModels() {
+		if s.memberOf(m) != gid {
+			continue
+		}
+		if st == process.StateReady {
+			ready = append(ready, m)
+		} else {
+			others = append(others, m)
+		}
+	}
+	if len(ready) > 0 {
+		sort.Strings(ready)
+		return ready[0]
+	}
+	if len(others) > 0 {
+		sort.Strings(others)
+		return others[0]
+	}
+	return ""
+}
+
+// fuzzyApplies: busy -> yes; idle -> only within the idle window of a group
+// that has served at least once (never-served means a real switch).
+func (s *FIFO) fuzzyApplies(gid string) bool {
+	if s.groupBusy(gid) {
+		return true
+	}
+	t, ok := s.lastServeDone[gid]
+	if !ok {
+		return false
+	}
+	win := s.fuzzy.idleTimeout[gid]
+	if win == 0 {
+		return false
+	}
+	return s.now().Sub(t) < win
+}
+
+// groupBusy: any group member serving, queued, or targeted/evicted by an
+// in-flight swap.
+func (s *FIFO) groupBusy(gid string) bool {
+	for m, n := range s.inFlight {
+		if n > 0 && s.memberOf(m) == gid {
+			return true
+		}
+	}
+	for _, it := range s.queued {
+		if s.memberOf(it.Req.Model) == gid {
+			return true
+		}
+	}
+	for target, sw := range s.active {
+		if s.memberOf(target) == gid {
+			return true
+		}
+		for _, e := range sw.evict {
+			if s.memberOf(e) == gid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *FIFO) memberOf(m string) string { return s.fuzzy.groupOf[m] }
 
 // runningSet is the live model set handed to the Swapper: every process the
 // baseRouter reports as running, unioned with the targets of in-flight swaps
@@ -546,8 +761,9 @@ func containsString(xs []string, s string) bool {
 // broadcastQueuePositions sends each queued request its current 1-indexed
 // position. Sends are non-blocking: if the channel is full, the old value is
 // drained first so the consumer always sees the latest position.
-func broadcastQueuePositions(queued []HandlerReq) {
-	for i, req := range queued {
+func broadcastQueuePositions(queued []queuedItem) {
+	for i, item := range queued {
+		req := item.Req
 		pos := i + 1
 		select {
 		case req.PositionCh <- pos:

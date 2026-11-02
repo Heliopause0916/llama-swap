@@ -755,6 +755,16 @@ routing:
             - "llama"
             - "qwen-unlisted"
 
+          # fuzzy: let this swap group answer requests for a different member
+          # with whichever member is already online instead of swapping
+          # - optional, default: false
+          # - requires swap: true
+          # - while the group is busy, or within fuzzyIdleTimeout of its last
+          #   served request, a request for another member is served by the
+          #   online model without switching
+          # fuzzy: true
+          # fuzzyIdleTimeout: 300
+
         # group2: members all run together, but loading any other group
         # unloads them.
         "group2":
@@ -867,15 +877,41 @@ routing:
     use: fifo
     settings:
       fifo:
-        # priority: a dictionary of model ID -> priority
-        # - optional, default: empty dictionary
-        # - models default to priority 0
+        # priorityHeader: the request header carrying the priority band
+        # - optional; when empty the request-priority feature is off (pure FIFO)
+        priorityHeader: "X-Request-Priority"
+
+        # requestPriority: a dictionary of header band name -> numeric priority
+        # - optional, default: empty dictionary (feature off)
+        # - requests default to the defaultPriority band
         # - higher priority requests are serviced first in the queue
-        priority:
-          A: 10
-          B: 5
-          C: 5
-          D: 1
+        requestPriority:
+          high: 100
+          medium: 60
+          low: 30
+
+        # defaultPriority: the band used when the header is absent or unknown
+        # - optional, default: 0
+        # - only consulted when requestPriority is non-empty
+        defaultPriority: 60
+
+        # queueDepth: per-model queue capacity beyond the concurrency limit
+        # - optional, default: 10
+        # - 0 disables queueing (over-limit requests get 429 from upstream)
+        # - >0 allows that many requests to queue
+        queueDepth: 10
+
+        # queueTimeout: max wait a queued request tolerates before it is
+        # dropped with 429 + Retry-After: 1
+        # - optional, default: 60 (seconds)
+        # - 0 waits forever
+        queueTimeout: 60
+
+        # promoteAfter: a queued request older than this is promoted to the
+        # top tier at the next drain (anti-starvation)
+        # - optional, default: 0 (off)
+        # - must be < the effective queueTimeout (D20)
+        promoteAfter: 30
 
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary

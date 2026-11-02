@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"sort"
 	"strings"
@@ -261,6 +262,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 				}
 				memberUsage[member] = groupID
 			}
+			if groupConfig.Fuzzy && !groupConfig.Swap {
+				return Config{}, fmt.Errorf("group %s: fuzzy requires swap: true", groupID)
+			}
+			if t := groupConfig.FuzzyIdleTimeout; t != nil && *t < 0 {
+				return Config{}, fmt.Errorf("group %s: fuzzyIdleTimeout must be >= 0", groupID)
+			}
 		}
 	}
 
@@ -281,9 +288,42 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	if config.Routing.Scheduler.Use != "fifo" {
 		return Config{}, fmt.Errorf("routing.scheduler.use: unknown scheduler %q (valid: fifo)", config.Routing.Scheduler.Use)
 	}
-	for modelID := range config.Routing.Scheduler.Settings.Fifo.Priority {
-		if _, found := config.RealModelName(modelID); !found {
-			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)
+	f := config.Routing.Scheduler.Settings.Fifo
+	if f.legacyPriority {
+		slog.Warn("routing.scheduler.settings.fifo.priority is deprecated and ignored; " +
+			"use requestPriority/defaultPriority instead")
+	}
+	const maxBand = int(^uint32(0) >> 1) // 2147483647 = P_max (D17)
+	for name, band := range f.RequestPriority {
+		if band >= maxBand {
+			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.requestPriority[%q]: value %d must be < %d", name, band, maxBand)
+		}
+	}
+	if f.DefaultPriority >= maxBand {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.defaultPriority: value %d must be < %d", f.DefaultPriority, maxBand)
+	}
+	if f.QueueDepth != nil && *f.QueueDepth < 0 {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.queueDepth must be >= 0")
+	}
+	if f.QueueTimeout != nil && *f.QueueTimeout < 0 {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.queueTimeout must be >= 0")
+	}
+	if f.PromoteAfter != nil && *f.PromoteAfter < 0 {
+		return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.promoteAfter must be >= 0")
+	}
+	// D20: effective queueTimeout (nil->60s, >0->value, 0->infinite) must be > promoteAfter.
+	if f.PromoteAfter != nil && *f.PromoteAfter > 0 {
+		if f.QueueTimeout != nil && *f.QueueTimeout == 0 {
+			// queueTimeout=0 is infinite wait: promotion always has a chance to
+			// fire, so the D20 ordering constraint does not apply.
+		} else {
+			eff := 60 // nil default
+			if f.QueueTimeout != nil && *f.QueueTimeout > 0 {
+				eff = *f.QueueTimeout
+			}
+			if eff <= *f.PromoteAfter {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo: queueTimeout (%ds) must be > promoteAfter (%ds) (promotion would never fire)", eff, *f.PromoteAfter)
+			}
 		}
 	}
 
