@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Model } from "../lib/types";
   import { enterMaintenance, exitMaintenance } from "../stores/api";
-  import { Play, Wrench } from "@lucide/svelte";
+  import { Wrench, WrenchOff } from "@lucide/svelte";
 
   interface Props {
     model: Model;
@@ -36,7 +36,7 @@
   onclick={handleToggleMaintenance}
 >
   {#if model.maintenance}
-    <Play class="size-4" />
+    <WrenchOff class="size-4" />
   {:else}
     <Wrench class="size-4" />
   {/if}
