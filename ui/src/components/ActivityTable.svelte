@@ -200,7 +200,9 @@
       { id: "identity", label: "Address", defaultVisible: true },
       { id: "user_agent", label: "User Agent", defaultVisible: true },
       { id: "session_id", label: "Session ID", defaultVisible: true },
-      { id: "bytes_received", label: "Bytes Received", defaultVisible: true }
+      { id: "bytes_received", label: "Bytes Received", defaultVisible: true },
+      { id: "priority", label: "Priority", defaultVisible: false },
+      { id: "served", label: "Served", defaultVisible: false }
     );
     return cols;
   }
@@ -816,6 +818,12 @@
                     <MiddleEllipsis value={session} tailLength={8} className="max-w-[14rem] font-mono text-xs" />
                   {:else if columnId === "bytes_received"}
                     <span class="font-mono text-xs tabular-nums">{formatBytes(request.resp_bytes)}</span>
+                  {:else if columnId === "priority"}
+                    {@const prio = request.metadata?.priority}
+                    <span class="font-mono text-xs tabular-nums">{prio ?? "—"}</span>
+                  {:else if columnId === "served"}
+                    {@const served = request.metadata?.served_model}
+                    <MiddleEllipsis value={served ?? "—"} tailLength={10} className="max-w-[14rem] text-xs" />
                   {/if}
                 </Table.Cell>
               {/each}
