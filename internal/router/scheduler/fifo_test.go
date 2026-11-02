@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -180,6 +181,14 @@ func reqCh(model string) HandlerReq {
 func reqP(model string, priority int) HandlerReq {
 	r := req(model)
 	r.Priority = priority
+	return r
+}
+
+// reqInflight creates a HandlerReq whose context carries the server's inflight
+// ID, so QueueSnapshot can tie it to an inflight row.
+func reqInflight(model, id string) HandlerReq {
+	r := req(model)
+	r.Ctx = swaputil.WithInflightID(context.Background(), id)
 	return r
 }
 
@@ -1676,5 +1685,76 @@ func TestFIFO_Fuzzy_GrantErrorNoMetadata(t *testing.T) {
 	}
 	if _, has := data.Metadata["fifo_priority"]; has {
 		t.Error("fifo_priority should not be written on grantError")
+	}
+}
+
+// TestFIFO_QueueSnapshot_EmptyWhenNoQueue verifies an empty queue yields nil.
+func TestFIFO_QueueSnapshot_EmptyWhenNoQueue(t *testing.T) {
+	s := newFIFO(&stubPlanner{}, newFakeEffects())
+	if got := s.QueueSnapshot(); got != nil {
+		t.Fatalf("QueueSnapshot() = %v, want nil", got)
+	}
+}
+
+// TestFIFO_QueueSnapshot_ReturnsPositions verifies the snapshot lists each
+// queued request's inflight ID and 1-indexed position in enqueue order.
+func TestFIFO_QueueSnapshot_ReturnsPositions(t *testing.T) {
+	s := newFIFO(&stubPlanner{}, newFakeEffects())
+	s.enqueue(reqInflight("a", "id1"))
+	s.enqueue(reqInflight("b", "id2"))
+
+	got := s.QueueSnapshot()
+	want := []QueueEntry{{InflightID: "id1", Position: 1}, {InflightID: "id2", Position: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("QueueSnapshot() = %v, want %v", got, want)
+	}
+}
+
+// TestFIFO_QueueSnapshot_SkipsNoInflightID verifies queued requests that never
+// passed through the inflight middleware are omitted, while Position still
+// reflects their physical index (i+1) in the queue.
+func TestFIFO_QueueSnapshot_SkipsNoInflightID(t *testing.T) {
+	s := newFIFO(&stubPlanner{}, newFakeEffects())
+	s.enqueue(req("a"))               // no InflightID -> skipped
+	s.enqueue(reqInflight("b", "id")) // physical position 2
+
+	got := s.QueueSnapshot()
+	want := []QueueEntry{{InflightID: "id", Position: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("QueueSnapshot() = %v, want %v", got, want)
+	}
+}
+
+// TestFIFO_QueueSnapshot_ReflectsDrainOrder verifies the positions reported
+// after drainQueue reflect the aging re-ranked effective service order.
+func TestFIFO_QueueSnapshot_ReflectsDrainOrder(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	qd := 10
+	pa := 10
+	models := map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}
+	cfg := config.FifoConfig{QueueDepth: &qd, PromoteAfter: &pa}
+	s := newFIFOWithClock(&stubPlanner{}, eff, cfg, models, clock)
+
+	// Occupy the single serving slot so the queue never drains.
+	s.OnRequest(req("a"))
+	if eff.served("a") != 1 {
+		t.Fatalf("served(a)=%d want 1", eff.served("a"))
+	}
+
+	// Older lower-priority and younger higher-priority requests, both queued.
+	s.enqueue(reqInflight("a", "old"))
+	clock.advance(15 * time.Second)
+	s.enqueue(reqInflight("a", "young"))
+	clock.advance(5 * time.Second) // "old" is now 20s old (>= promoteAfter)
+
+	// drainQueue re-ranks by effective priority: "old" is promoted first.
+	s.drainQueue()
+
+	got := s.QueueSnapshot()
+	want := []QueueEntry{{InflightID: "old", Position: 1}, {InflightID: "young", Position: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("QueueSnapshot() = %v, want %v", got, want)
 	}
 }

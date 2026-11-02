@@ -28,6 +28,10 @@ type unloadReq struct {
 	respond chan struct{}
 }
 
+type queueSnapReq struct {
+	respond chan []scheduler.QueueEntry
+}
+
 // baseRouter owns the channels, run-loop, and process machinery shared by every
 // concrete router. Concrete routers embed *baseRouter and supply a
 // scheduler.Swapper describing how eviction sets are decided. baseRouter
@@ -60,6 +64,7 @@ type baseRouter struct {
 	unloadCh    chan unloadReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
+	queueSnapCh chan queueSnapReq
 
 	runDone chan struct{}
 
@@ -100,6 +105,7 @@ func newBaseRouter(
 		unloadCh:    make(chan unloadReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
+		queueSnapCh: make(chan queueSnapReq),
 		runDone:     make(chan struct{}),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
@@ -144,6 +150,9 @@ func (b *baseRouter) run() {
 
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
+
+		case req := <-b.queueSnapCh:
+			req.respond <- b.schedule.QueueSnapshot()
 		}
 	}
 }
@@ -500,6 +509,24 @@ func (b *baseRouter) sendUnload(targets []string, timeout time.Duration) {
 		return
 	}
 	<-req.respond
+}
+
+// QueueSnapshot funnels one snapshot request through the run loop and blocks
+// until the scheduler returns the current queue. Returns nil when the router
+// has shut down.
+func (b *baseRouter) QueueSnapshot() []scheduler.QueueEntry {
+	req := queueSnapReq{respond: make(chan []scheduler.QueueEntry, 1)}
+	select {
+	case b.queueSnapCh <- req:
+	case <-b.runDone:
+		return nil
+	}
+	select {
+	case out := <-req.respond:
+		return out
+	case <-b.runDone:
+		return nil
+	}
 }
 
 func (b *baseRouter) Shutdown(timeout time.Duration) error {

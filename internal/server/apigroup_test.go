@@ -14,6 +14,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/hw"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -734,5 +735,125 @@ func TestServer_APILogEvents_InvalidStream(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", target, w.Code)
 		}
+	}
+}
+
+// TestServer_InflightStageMergeQueued verifies inflightWithStage marks a
+// matched snapshot entry "queued" with its queue position and everything else
+// "serving".
+func TestServer_InflightStageMergeQueued(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.queueSnapshot = []scheduler.QueueEntry{{InflightID: "1", Position: 2}}
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	update := swaputil.InFlightRequestsEvent{
+		Operation: inflightOperationSnapshot,
+		Requests: []swaputil.InflightRequestEntry{
+			{ID: "1"},
+			{ID: "2"},
+		},
+	}
+	got := s.inflightWithStage(update)
+
+	if got.Requests[0].Stage != "queued" || got.Requests[0].QueuePosition != 2 {
+		t.Errorf("Requests[0] = %+v, want stage queued pos 2", got.Requests[0])
+	}
+	if got.Requests[1].Stage != "serving" || got.Requests[1].QueuePosition != 0 {
+		t.Errorf("Requests[1] = %+v, want stage serving pos 0", got.Requests[1])
+	}
+}
+
+// TestServer_InflightStageMergeUpsert verifies an upsert event's Request pointer
+// is staged correctly while the tracker's live entry stays untouched.
+func TestServer_InflightStageMergeUpsert(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.queueSnapshot = []scheduler.QueueEntry{{InflightID: "1", Position: 1}}
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	id := s.inflight.Add(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx), cancel)
+	defer s.inflight.Remove(id)
+
+	// Current() snapshot is a copy; stage the event from it.
+	live := s.inflight.Current()
+	update := swaputil.InFlightRequestsEvent{Operation: inflightOperationUpsert, Request: &live.Requests[0]}
+	got := s.inflightWithStage(update)
+
+	if got.Request == nil || got.Request.ID != id || got.Request.Stage != "queued" || got.Request.QueuePosition != 1 {
+		t.Fatalf("merged upsert = %+v, want id %q stage queued pos 1", got.Request, id)
+	}
+	// The tracker's live entry must not be mutated by the merge.
+	after := s.inflight.Current()
+	if after.Requests[0].Stage != "" || after.Requests[0].QueuePosition != 0 {
+		t.Fatalf("tracker live entry mutated: %+v", after.Requests[0])
+	}
+}
+
+// TestServer_InflightStageNilLocal verifies inflightWithStage is a no-op when
+// the local router is nil.
+func TestServer_InflightStageNilLocal(t *testing.T) {
+	s := newTestServer(nil, newStubRouter(nil, ""))
+
+	update := swaputil.InFlightRequestsEvent{
+		Operation: inflightOperationSnapshot,
+		Requests: []swaputil.InflightRequestEntry{
+			{ID: "1"},
+		},
+	}
+	got := s.inflightWithStage(update)
+
+	if got.Requests[0].Stage != "" || got.Requests[0].QueuePosition != 0 {
+		t.Fatalf("stage should be unset when local is nil: %+v", got.Requests[0])
+	}
+}
+
+// TestServer_InflightStageRemoveSkipsSnapshot verifies inflightWithStage
+// returns immediately for a remove event (no request to annotate) without
+// consulting the router's queue snapshot.
+func TestServer_InflightStageRemoveSkipsSnapshot(t *testing.T) {
+	local := newStubRouter(nil, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+
+	update := swaputil.InFlightRequestsEvent{Operation: inflightOperationRemove, ID: "1"}
+	got := s.inflightWithStage(update)
+
+	if got.ID != "1" {
+		t.Fatalf("remove event changed: %+v", got)
+	}
+	if n := local.queueSnapshotCalls.Load(); n != 0 {
+		t.Errorf("QueueSnapshot called %d times, want 0", n)
+	}
+}
+
+// TestServer_APIEvents_StagePollTicker verifies the /api/events stream
+// re-derives the in-flight stage on a poll interval, so a request that entered
+// the queue after its Add upsert still shows Queued #N. It waits for one poll
+// beyond the initial payload and asserts a second inflight snapshot arrives.
+func TestServer_APIEvents_StagePollTicker(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		s.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	// Wait long enough for the initial payload plus at least one poll tick.
+	time.Sleep(inflightStagePollInterval + 150*time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after context cancel")
+	}
+
+	body := w.Body.String()
+	if n := strings.Count(body, `"type":"inflight"`); n < 2 {
+		t.Errorf("expected at least 2 inflight snapshots (initial + poll), got %d; body=%q", n, body)
 	}
 }

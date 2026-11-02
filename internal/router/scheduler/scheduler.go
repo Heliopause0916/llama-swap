@@ -66,6 +66,10 @@ type Scheduler interface {
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
 	OnShutdown(err error)
+	// QueueSnapshot returns the current queue in effective service order, with
+	// each entry's inflight ID and 1-indexed position. Runs on the run-loop
+	// goroutine. nil when the queue is empty.
+	QueueSnapshot() []QueueEntry
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it
@@ -134,6 +138,14 @@ type HandlerReq struct {
 type HandlerResp struct {
 	HandleFunc http.HandlerFunc
 	Err        error
+}
+
+// QueueEntry describes one queued request's position. InflightID ties it to
+// the server's inflight entry; Position is 1-indexed in effective service
+// order (after any aging re-rank).
+type QueueEntry struct {
+	InflightID string
+	Position   int
 }
 
 // SwapDone is reported by a swap goroutine when its target is ready (or failed).

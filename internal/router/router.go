@@ -6,6 +6,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -62,4 +63,8 @@ type LocalRouter interface {
 	// process. While it returns an error no model starts, and the requests
 	// that needed one get that error.
 	SetStartGate(gate func() error)
+
+	// QueueSnapshot returns the scheduler's current queue in effective service
+	// order, tied to inflight IDs, for the server's Stage badge column.
+	QueueSnapshot() []scheduler.QueueEntry
 }

@@ -86,6 +86,11 @@ type InflightRequestEntry struct {
 	RespBytes   int64             `json:"resp_bytes"`
 	ElapsedMs   int64             `json:"elapsed_ms"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	// Stage is "queued" when the request is in the scheduler queue, else
+	// "serving". Enriched at SSE dispatch from the router's QueueSnapshot.
+	Stage string `json:"stage,omitempty"`
+	// QueuePosition is the 1-indexed position when Stage is "queued", else 0.
+	QueuePosition int `json:"queue_position,omitempty"`
 }
 
 type ProfileChangedEvent struct {

@@ -77,3 +77,28 @@ func TestServer_InflightPriorityFromMiddleware(t *testing.T) {
 		t.Fatalf("priority metadata = %q, want 100", got.Metadata["priority"])
 	}
 }
+
+// TestServer_InflightStageMiddlewareInjectsID verifies CreateInflightMiddleware
+// makes the Add() id retrievable from the downstream handler's request context
+// via swaputil.InflightID.
+func TestServer_InflightStageMiddlewareInjectsID(t *testing.T) {
+	tracker := newInflightTracker()
+	mw := CreateInflightMiddleware(tracker, config.Config{})
+
+	var gotID string
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := swaputil.InflightID(r.Context())
+		if !ok {
+			t.Fatal("InflightID not present in downstream context")
+		}
+		gotID = id
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req = req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{ModelID: "m1"}))
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotID == "" {
+		t.Fatal("middleware did not inject a non-empty inflight id")
+	}
+}

@@ -35,6 +35,10 @@ type queuedItem struct {
 	Req        HandlerReq
 	Deadline   time.Time
 	EnqueuedAt time.Time
+	// InflightID ties this queued request to the server's inflight entry, so
+	// QueueSnapshot can report its stage/queue_position. Empty when the request
+	// never passed through the inflight middleware (e.g. tests).
+	InflightID string
 }
 
 // FIFO is the default scheduler. Requests are handled in a first-in, first-out order.
@@ -469,6 +473,9 @@ func (s *FIFO) enqueue(req HandlerReq) {
 		deadline = now.Add(s.queueTimeout)
 	}
 	item := queuedItem{Req: req, Deadline: deadline, EnqueuedAt: now}
+	if id, ok := swaputil.InflightID(req.Ctx); ok {
+		item.InflightID = id
+	}
 	p := req.Priority
 	i := len(s.queued)
 	for j, q := range s.queued {
@@ -546,6 +553,24 @@ func (s *FIFO) drainQueue() {
 	}
 	s.queued = remaining
 	broadcastQueuePositions(s.queued)
+}
+
+// QueueSnapshot returns the current queue in effective service order. Position
+// is the 1-indexed physical position (i+1) in s.queued, matching the loading
+// stream's "Queue position: #N"; items without an InflightID are skipped. Runs
+// on the run-loop goroutine. nil when the queue is empty.
+func (s *FIFO) QueueSnapshot() []QueueEntry {
+	if len(s.queued) == 0 {
+		return nil
+	}
+	out := make([]QueueEntry, 0, len(s.queued))
+	for i, item := range s.queued {
+		if item.InflightID == "" {
+			continue
+		}
+		out = append(out, QueueEntry{InflightID: item.InflightID, Position: i + 1})
+	}
+	return out
 }
 
 // effective returns the aging-adjusted scheduling priority (D18). now is the

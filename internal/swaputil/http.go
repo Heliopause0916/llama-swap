@@ -132,6 +132,26 @@ func ClientContext(ctx context.Context) context.Context {
 	return ctx
 }
 
+// inflightIDKey carries the server's inflight entry ID through the request
+// context so the scheduler can tie a queued request back to its inflight row.
+type inflightIDKey struct{}
+
+// WithInflightID returns ctx carrying id as the request's inflight ID.
+func WithInflightID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, inflightIDKey{}, id)
+}
+
+// InflightID returns the inflight ID recorded by the server's inflight
+// middleware, if present. ok is false when the request never passed through
+// the middleware (or ctx is nil).
+func InflightID(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	id, ok := ctx.Value(inflightIDKey{}).(string)
+	return id, ok
+}
+
 // ResponseStarted reports whether a response status has already reached the
 // client, in which case an error handler has nothing useful left to send.
 func ResponseStarted(w http.ResponseWriter) bool {

@@ -1009,3 +1009,18 @@ func TestFetchContext_BodyOverSizeCap(t *testing.T) {
 		t.Fatalf("err = %v, want it to wrap *http.MaxBytesError with Limit 10", err)
 	}
 }
+
+func TestSwaputil_InflightIDRoundTrip(t *testing.T) {
+	ctx := WithInflightID(context.Background(), "req-123")
+	id, ok := InflightID(ctx)
+	if !ok || id != "req-123" {
+		t.Fatalf("InflightID() = %q, %v, want req-123, true", id, ok)
+	}
+}
+
+func TestSwaputil_InflightIDNilCtx(t *testing.T) {
+	id, ok := InflightID(nil)
+	if ok || id != "" {
+		t.Fatalf("InflightID(nil) = %q, %v, want \"\", false", id, ok)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -41,6 +42,10 @@ type stubRouter struct {
 	unloadTimeout time.Duration
 	onUnload      func()
 	loggers       map[string]*logmon.Monitor
+	queueSnapshot []scheduler.QueueEntry
+	// queueSnapshotCalls counts QueueSnapshot calls so tests can assert
+	// whether inflightWithStage consulted the queue.
+	queueSnapshotCalls atomic.Int32
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -79,6 +84,10 @@ func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
 	}
 }
 func (s *stubRouter) SetStartGate(func() error) {}
+func (s *stubRouter) QueueSnapshot() []scheduler.QueueEntry {
+	s.queueSnapshotCalls.Add(1)
+	return s.queueSnapshot
+}
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	if s.loggers != nil {
 		if lg, ok := s.loggers[modelID]; ok {

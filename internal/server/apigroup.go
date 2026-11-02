@@ -543,6 +543,14 @@ const (
 // were dropped because the send buffer was full.
 const sendDropReportInterval = 5 * time.Second
 
+// inflightStagePollInterval is how often the /api/events stream re-derives
+// each in-flight request's Stage badge from the scheduler queue. A request's
+// Add upsert is emitted before it enters the scheduler queue, and a queued
+// request produces no response bytes or headers, so no other event refreshes
+// its stage. The poll keeps a queued request showing Queued #N within this
+// interval instead of Serving for the whole queue wait.
+const inflightStagePollInterval = 500 * time.Millisecond
+
 type messageEnvelope struct {
 	Type messageType `json:"type"`
 	Data string      `json:"data"`
@@ -627,6 +635,53 @@ func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request, name string, s
 	}
 }
 
+// inflightWithStage enriches an inflight event with each request's Stage badge
+// by matching its ID against the local router's current QueueSnapshot. Entries
+// still in the queue get stage "queued" and their 1-indexed position; every
+// other entry gets "serving". It mutates only per-consumer copies of the event
+// (update.Request / update.Requests), never the tracker's live req.entry, so
+// the snapshot enrichment is race-free even when several SSE connections
+// process the same event concurrently. Returns update unchanged when the local
+// router is nil.
+func (s *Server) inflightWithStage(update swaputil.InFlightRequestsEvent) swaputil.InFlightRequestsEvent {
+	// Skip the queue snapshot when there is no local router or no entry to
+	// annotate (e.g. a remove event carries no request), avoiding a run-loop
+	// round-trip that cannot change any stage.
+	if s.local == nil || (update.Request == nil && len(update.Requests) == 0) {
+		return update
+	}
+	snap := s.local.QueueSnapshot()
+	posByID := make(map[string]int, len(snap))
+	for _, e := range snap {
+		posByID[e.InflightID] = e.Position
+	}
+	apply := func(entry *swaputil.InflightRequestEntry) {
+		if pos, ok := posByID[entry.ID]; ok {
+			entry.Stage = "queued"
+			entry.QueuePosition = pos
+		} else {
+			entry.Stage = "serving"
+			entry.QueuePosition = 0
+		}
+	}
+	if update.Request != nil {
+		// Copy the entry so a per-SSE-consumer mutation never races with
+		// another consumer sharing the same event-bus copy.
+		entry := *update.Request
+		apply(&entry)
+		update.Request = &entry
+	}
+	if len(update.Requests) > 0 {
+		requests := make([]swaputil.InflightRequestEntry, len(update.Requests))
+		copy(requests, update.Requests)
+		for i := range requests {
+			apply(&requests[i])
+		}
+		update.Requests = requests
+	}
+	return update
+}
+
 // handleAPIEvents streams server events (model status, activity, in-flight
 // requests, UI config, profile and pause changes) to the client as Server-Sent
 // Events. Log data has its own stream, handleAPILogEvents.
@@ -643,6 +698,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sendInFlight := func(update swaputil.InFlightRequestsEvent) {
+			update = s.inflightWithStage(update)
 			if update.Operation == inflightOperationSnapshot && update.Requests == nil {
 				update.Requests = []swaputil.InflightRequestEntry{}
 			}
@@ -693,7 +749,29 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 		sendPause()
 		sendInFlight(s.inflight.Current())
 
-		return func() { cancelAll(unsubscribe) }
+		// Re-derive stage badges periodically. A request's Add upsert is
+		// emitted before it enters the scheduler queue, and a queued request
+		// produces no response bytes or headers, so no other event refreshes
+		// its stage. The poll keeps a queued request showing Queued #N within
+		// inflightStagePollInterval instead of Serving for the whole queue wait.
+		stopStagePoll := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(inflightStagePollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					sendInFlight(s.inflight.Current())
+				case <-stopStagePoll:
+					return
+				}
+			}
+		}()
+
+		return func() {
+			close(stopStagePoll)
+			cancelAll(unsubscribe)
+		}
 	})
 }
 

@@ -415,6 +415,7 @@ func CreateInflightMiddleware(t *inflightTracker, cfg config.Config) chain.Middl
 			r = r.WithContext(ctx)
 			id := t.Add(r, cancel)
 			defer t.Remove(id)
+			r = r.WithContext(swaputil.WithInflightID(r.Context(), id))
 
 			next.ServeHTTP(&inflightResponseWriter{ResponseWriter: w, tracker: t, id: id}, r)
 		})
