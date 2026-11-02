@@ -136,6 +136,10 @@ type ProcessCommand struct {
 	lastUse  atomic.Int64
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
 
+	// pinned is set by the router when a model is pinned; the TTL idle-unload
+	// goroutine skips a pinned model. Owned by the router, read here.
+	pinned atomic.Bool
+
 	// detected is what capcompat.Detect found when the process last became
 	// ready. Cleared at the start of each doStart; nil until detection
 	// succeeds.
@@ -170,6 +174,9 @@ func New(
 }
 
 func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
+
+// SetPinned updates the pinned flag consulted by the TTL idle-unload goroutine.
+func (p *ProcessCommand) SetPinned(on bool) { p.pinned.Store(on) }
 
 // run is the single-writer goroutine that owns all mutable lifecycle state
 // (current ProcessState, the running *exec.Cmd, the active reverse-proxy
@@ -374,6 +381,9 @@ func (p *ProcessCommand) run() {
 									return
 								}
 								if p.inflight.Load() != 0 {
+									continue
+								}
+								if p.pinned.Load() {
 									continue
 								}
 								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {

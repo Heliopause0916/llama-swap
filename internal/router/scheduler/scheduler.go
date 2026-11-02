@@ -96,6 +96,10 @@ type Effects interface {
 	// StopProcesses stops the named processes in parallel and blocks until all
 	// have stopped. Unknown IDs are skipped.
 	StopProcesses(timeout time.Duration, ids []string)
+	// IsPinned reports whether modelID is pinned (never TTL-unloaded or evicted).
+	IsPinned(modelID string) bool
+	// IsMaintenance reports whether modelID is under maintenance (never started).
+	IsMaintenance(modelID string) bool
 }
 
 // New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured

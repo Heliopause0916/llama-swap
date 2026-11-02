@@ -12,6 +12,7 @@ const ModelCapabilitiesChangedEventID = 0x09
 const ProcessLoadingEventID = 0x0A
 const InferencePausedEventID = 0x0B
 const UpstreamDetectedEventID = 0x0C
+const ModelPinStateEventID = 0x0D
 
 // ProcessStateChangeEvent is emitted whenever a process transitions between
 // lifecycle states. States are carried as strings so this package stays a leaf
@@ -121,4 +122,14 @@ type InferencePausedEvent struct {
 
 func (e InferencePausedEvent) Type() uint32 {
 	return InferencePausedEventID
+}
+
+// ModelPinStateEvent is emitted when a model's pin or maintenance state changes,
+// so the UI can re-read modelStatus.
+type ModelPinStateEvent struct {
+	ModelID string
+}
+
+func (e ModelPinStateEvent) Type() uint32 {
+	return ModelPinStateEventID
 }

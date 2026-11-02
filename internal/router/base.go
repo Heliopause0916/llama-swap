@@ -74,6 +74,15 @@ type baseRouter struct {
 	// get the error. See SetStartGate.
 	startGate atomic.Pointer[func() error]
 
+	// pinMu guards pinned and maintenance. Reads happen on the scheduler run-loop
+	// goroutine (hot path, shared RLock) and on HTTP goroutines (modelStatus),
+	// writes only from API handlers (rare, exclusive Lock).
+	pinMu sync.RWMutex
+	// pinned holds models that must not be TTL-unloaded or evicted. In-memory only.
+	pinned map[string]bool
+	// maintenance holds models that must never start. In-memory only.
+	maintenance map[string]bool
+
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
 	// for run() to reach a deterministic state without sleeping. serveDone
@@ -108,6 +117,8 @@ func newBaseRouter(
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		queueSnapCh: make(chan queueSnapReq),
 		runDone:     make(chan struct{}),
+		pinned:      make(map[string]bool),
+		maintenance: make(map[string]bool),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -190,6 +201,67 @@ func (b *baseRouter) ModelState(modelID string) (process.ProcessState, bool) {
 		return zero, false
 	}
 	return p.State(), true
+}
+
+// pinnedSetter is implemented by *ProcessCommand. A narrow interface so the
+// process.Process contract and test fakes (fakeProcess) stay unchanged.
+type pinnedSetter interface{ SetPinned(bool) }
+
+// IsPinned reports whether modelID is pinned (never TTL-unloaded or evicted).
+func (b *baseRouter) IsPinned(modelID string) bool {
+	b.pinMu.RLock()
+	defer b.pinMu.RUnlock()
+	return b.pinned[modelID]
+}
+
+// IsMaintenance reports whether modelID is under maintenance (never started).
+func (b *baseRouter) IsMaintenance(modelID string) bool {
+	b.pinMu.RLock()
+	defer b.pinMu.RUnlock()
+	return b.maintenance[modelID]
+}
+
+// PinModel marks modelID as pinned. No-op when the model is not local.
+func (b *baseRouter) PinModel(modelID string) {
+	b.setPinned(modelID, true)
+}
+
+// UnpinModel removes the pin from modelID.
+func (b *baseRouter) UnpinModel(modelID string) {
+	b.setPinned(modelID, false)
+}
+
+// setPinned updates the in-memory pinned set and lets the process's TTL
+// goroutine skip unloading while pinned.
+func (b *baseRouter) setPinned(modelID string, on bool) {
+	b.pinMu.Lock()
+	if on {
+		b.pinned[modelID] = true
+	} else {
+		delete(b.pinned, modelID)
+	}
+	b.pinMu.Unlock()
+	if p, ok := b.processes[modelID]; ok {
+		if ps, ok := p.(pinnedSetter); ok {
+			ps.SetPinned(on)
+		}
+	}
+}
+
+// SetMaintenance marks/clears modelID as under maintenance. When entering
+// maintenance, a running model is unloaded so it can never start again.
+func (b *baseRouter) SetMaintenance(modelID string, on bool) {
+	b.pinMu.Lock()
+	if on {
+		b.maintenance[modelID] = true
+	} else {
+		delete(b.maintenance, modelID)
+	}
+	b.pinMu.Unlock()
+	// Entering maintenance must never leave the model up.
+	if on {
+		b.Unload(0, modelID)
+	}
 }
 
 // SetStartGate installs a check that runs before every swap; a nil gate
@@ -296,6 +368,13 @@ func setLocalHint(r *http.Request, p process.Process) {
 }
 
 func (b *baseRouter) doSwap(ctx context.Context, modelID string, generation uint64, toStop []string) {
+	// Never start a maintenance model, even if something bypassed the scheduler.
+	if b.IsMaintenance(modelID) {
+		b.reportSwapDone(ctx, modelID, generation,
+			fmt.Errorf("%s: model %s is under maintenance: %w", b.name, modelID, swaputil.ErrMaintenance))
+		return
+	}
+
 	timeout := b.healthCheckTimeout()
 
 	var wg sync.WaitGroup

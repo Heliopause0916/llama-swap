@@ -146,12 +146,39 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// (0) Fuzzy rewrite — before ALL bookkeeping (admit/reserved/inFlight/queued/active).
 	req = s.fuzzySubstitute(req)
 
+	// (0b) Maintenance interception — never start/route to a maintenance model.
+	req, ok := s.maintenanceSubstitute(req)
+	if !ok {
+		s.rejectAdmission(req, swaputil.ErrMaintenance)
+		return
+	}
+
 	// (1) Unknown model.
 	state, ok := s.effects.ModelState(req.Model)
 	if !ok {
 		s.logger.Debugf("%s: model %s not handled by this router", s.name, req.Model)
 		s.rejectAdmission(req, ErrModelNotFound)
 		return
+	}
+
+	// Compute the eviction set once, before admit, so a PIN-protection rewrite
+	// reserves concurrency for the model it actually serves.
+	running := s.runningSet(req.Model)
+	evict := s.planner.EvictionFor(req.Model, running)
+
+	// (1a) PIN protection — if serving req.Model would evict a pinned model,
+	// force-fuzzy (same group) or reject. Runs before admit.
+	if rewritten, err := s.protectPinned(&req, running, evict); err != nil {
+		s.rejectAdmission(req, err)
+		return
+	} else if rewritten {
+		state, ok = s.effects.ModelState(req.Model)
+		if !ok {
+			s.rejectAdmission(req, ErrModelNotFound)
+			return
+		}
+		running = s.runningSet(req.Model)
+		evict = s.planner.EvictionFor(req.Model, running)
 	}
 
 	if !s.admit(req) {
@@ -172,9 +199,6 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		sw.waiters = append(sw.waiters, req)
 		return
 	}
-
-	running := s.runningSet(req.Model)
-	evict := s.planner.EvictionFor(req.Model, running)
 
 	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
@@ -522,6 +546,12 @@ func (s *FIFO) drainQueue() {
 			s.grantError(req, ErrModelNotFound)
 			continue
 		}
+		// Maintenance: a maintenance model is never started, so a queued
+		// request for it is rejected rather than held.
+		if s.effects.IsMaintenance(req.Model) {
+			s.grantError(req, swaputil.ErrMaintenance)
+			continue
+		}
 		// In-flight capacity gate (inFlight >= limit): keep queued (D19 keeps
 		// EnqueuedAt). This is the deadlock-free form.
 		if s.inFlight[req.Model] >= s.limit(req.Model) {
@@ -535,6 +565,13 @@ func (s *FIFO) drainQueue() {
 		}
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
+		// PIN protection (reject only, never rewrite): a queued request's
+		// concurrency slot is bound to its target model, so rewriting here
+		// would misalign reserved/inFlight. Reject and let the client retry.
+		if s.evictsPinned(evict) {
+			s.grantError(req, swaputil.ErrPinnedProtected)
+			continue
+		}
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
 			s.logger.Debugf("%s: queued request for model %s now served fast-path", s.name, req.Model)
 			s.grantHandler(req, req.Model)
@@ -604,16 +641,76 @@ func (s *FIFO) fuzzySubstitute(req HandlerReq) HandlerReq {
 	return req
 }
 
+// maintenanceSubstitute routes a request for a maintenance model onto an online
+// member of the same fuzzy group, or rejects it (ok=false) when the group has
+// no online fallback. Bypasses the fuzzy idle window: a maintenance model is
+// never started, so the group must keep serving if it can.
+func (s *FIFO) maintenanceSubstitute(req HandlerReq) (HandlerReq, bool) {
+	if !s.effects.IsMaintenance(req.Model) {
+		return req, true
+	}
+	gid, ok := s.fuzzy.groupOf[req.Model]
+	if !ok {
+		return req, false
+	}
+	served := s.fuzzyOnline(gid)
+	if served == "" || served == req.Model {
+		return req, false
+	}
+	s.logger.Debugf("%s: serving maintenance model %s with online model %s (group %s)",
+		s.name, req.Model, served, gid)
+	req.RequestedModel = req.Model
+	req.Model = served
+	return req, true
+}
+
+// protectPinned guards pinned models from being evicted. If evict contains a
+// pinned model and the request's model is in the same fuzzy group, it force-
+// rewrites req.Model to that pinned model (ignoring the fuzzy idle window).
+// Otherwise it returns ErrPinnedProtected. rewritten reports whether req.Model
+// was rewritten. The reservation for the (possibly rewritten) model is made by
+// the caller's subsequent admit(), so this must run before admit().
+func (s *FIFO) protectPinned(req *HandlerReq, running, evict []string) (rewritten bool, err error) {
+	for _, m := range evict {
+		if !s.effects.IsPinned(m) {
+			continue
+		}
+		if gid := s.fuzzy.groupOf[req.Model]; gid != "" && s.memberOf(m) == gid {
+			s.logger.Debugf("%s: protecting pinned model %s, serving it instead of %s (group %s)",
+				s.name, m, req.Model, gid)
+			req.RequestedModel = req.Model
+			req.Model = m
+			return true, nil
+		}
+		s.logger.Debugf("%s: rejecting request for %s: would evict pinned model %s",
+			s.name, req.Model, m)
+		return false, swaputil.ErrPinnedProtected
+	}
+	return false, nil
+}
+
+// evictsPinned reports whether any model in evict is pinned. drainQueue uses it
+// to reject (never rewrite) queued requests whose serving would evict a pinned
+// model, since a queued request's concurrency slot is bound to its target model.
+func (s *FIFO) evictsPinned(evict []string) bool {
+	for _, m := range evict {
+		if s.effects.IsPinned(m) {
+			return true
+		}
+	}
+	return false
+}
+
 // fuzzyOnline returns the model an incoming request would be fuzzed onto: the
 // in-flight swap target first (the direction the group is already switching),
-// else a running group member — preferring a Ready one, then lexicographically
-// first for determinism. "" when the group has neither.
+// else a running group member — preferring a pinned Ready one, then Ready, then
+// lexicographically first for determinism. Maintenance models are excluded.
+// "" when the group has neither.
 func (s *FIFO) fuzzyOnline(gid string) string {
-	// 1) in-flight swap targets belonging to gid (at most one colliding swap,
-	//    but collect+sort for determinism).
+	// 1) in-flight swap targets belonging to gid, skipping maintenance targets.
 	var targets []string
 	for target := range s.active {
-		if s.memberOf(target) == gid {
+		if s.memberOf(target) == gid && !s.effects.IsMaintenance(target) {
 			targets = append(targets, target)
 		}
 	}
@@ -621,17 +718,27 @@ func (s *FIFO) fuzzyOnline(gid string) string {
 		sort.Strings(targets)
 		return targets[0]
 	}
-	// 2) running members, preferring Ready.
-	var ready, others []string
+	// 2) running members: pinned Ready first, then Ready, then others, all
+	//    excluding maintenance targets.
+	var pinnedReady, ready, others []string
 	for m, st := range s.effects.RunningModels() {
-		if s.memberOf(m) != gid {
+		if s.memberOf(m) != gid || s.effects.IsMaintenance(m) {
 			continue
 		}
-		if st == process.StateReady {
-			ready = append(ready, m)
-		} else {
+		switch st {
+		case process.StateReady:
+			if s.effects.IsPinned(m) {
+				pinnedReady = append(pinnedReady, m)
+			} else {
+				ready = append(ready, m)
+			}
+		default:
 			others = append(others, m)
 		}
+	}
+	if len(pinnedReady) > 0 {
+		sort.Strings(pinnedReady)
+		return pinnedReady[0]
 	}
 	if len(ready) > 0 {
 		sort.Strings(ready)

@@ -67,4 +67,20 @@ type LocalRouter interface {
 	// QueueSnapshot returns the scheduler's current queue in effective service
 	// order, tied to inflight IDs, for the server's Stage badge column.
 	QueueSnapshot() []scheduler.QueueEntry
+
+	// IsPinned reports whether modelID is pinned (never TTL-unloaded or evicted).
+	IsPinned(modelID string) bool
+
+	// IsMaintenance reports whether modelID is under maintenance (never started).
+	IsMaintenance(modelID string) bool
+
+	// PinModel marks modelID as pinned. No-op when the model is not local.
+	PinModel(modelID string)
+
+	// UnpinModel removes the pin from modelID.
+	UnpinModel(modelID string)
+
+	// SetMaintenance marks/clears modelID as under maintenance. When entering
+	// maintenance, a running model is unloaded so it can never start again.
+	SetMaintenance(modelID string, on bool)
 }

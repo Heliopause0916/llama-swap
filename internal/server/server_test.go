@@ -46,6 +46,10 @@ type stubRouter struct {
 	// queueSnapshotCalls counts QueueSnapshot calls so tests can assert
 	// whether inflightWithStage consulted the queue.
 	queueSnapshotCalls atomic.Int32
+	// pins and maintenance hold the in-memory pin/maintenance state surfaced by
+	// IsPinned/IsMaintenance, so modelStatus can be asserted on.
+	pins        map[string]bool
+	maintenance map[string]bool
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -95,6 +99,31 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 		}
 	}
 	return nil, false
+}
+func (s *stubRouter) IsPinned(modelID string) bool { return s.pins[modelID] }
+func (s *stubRouter) IsMaintenance(modelID string) bool {
+	return s.maintenance[modelID]
+}
+func (s *stubRouter) PinModel(modelID string) {
+	if s.pins == nil {
+		s.pins = map[string]bool{}
+	}
+	s.pins[modelID] = true
+}
+func (s *stubRouter) UnpinModel(modelID string) {
+	if s.pins != nil {
+		delete(s.pins, modelID)
+	}
+}
+func (s *stubRouter) SetMaintenance(modelID string, on bool) {
+	if s.maintenance == nil {
+		s.maintenance = map[string]bool{}
+	}
+	if on {
+		s.maintenance[modelID] = true
+	} else {
+		delete(s.maintenance, modelID)
+	}
 }
 
 // newTestServer wires a Server with stub routers and a built mux.

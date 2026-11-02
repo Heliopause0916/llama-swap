@@ -59,6 +59,8 @@ type stopRec struct {
 type fakeEffects struct {
 	states       map[string]process.ProcessState // model -> state; missing => not handled
 	serveResult  map[string]bool                 // GrantServe return per model (default true)
+	pinned       map[string]bool                 // model -> pinned (default false)
+	maintenance  map[string]bool                 // model -> under maintenance (default false)
 	lastServeReq HandlerReq
 
 	starts    []startRec
@@ -71,6 +73,8 @@ func newFakeEffects() *fakeEffects {
 	return &fakeEffects{
 		states:      map[string]process.ProcessState{},
 		serveResult: map[string]bool{},
+		pinned:      map[string]bool{},
+		maintenance: map[string]bool{},
 		cancelled:   map[uint64]bool{},
 	}
 }
@@ -123,6 +127,10 @@ func (f *fakeEffects) GrantServe(req HandlerReq, modelID string) bool {
 func (f *fakeEffects) StopProcesses(timeout time.Duration, ids []string) {
 	f.stops = append(f.stops, stopRec{timeout: timeout, ids: ids})
 }
+
+func (f *fakeEffects) IsPinned(modelID string) bool { return f.pinned[modelID] }
+
+func (f *fakeEffects) IsMaintenance(modelID string) bool { return f.maintenance[modelID] }
 
 // served counts grants that handed modelID a handler and were received.
 func (f *fakeEffects) served(modelID string) int {
@@ -1756,5 +1764,147 @@ func TestFIFO_QueueSnapshot_ReflectsDrainOrder(t *testing.T) {
 	want := []QueueEntry{{InflightID: "old", Position: 1}, {InflightID: "young", Position: 2}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("QueueSnapshot() = %v, want %v", got, want)
+	}
+}
+
+// grantErrorFor returns the error recorded by GrantError for model, or nil when
+// no error grant addressed that model.
+func grantErrorFor(eff *fakeEffects, model string) error {
+	for _, g := range eff.grants {
+		if g.model == model && g.err != nil {
+			return g.err
+		}
+	}
+	return nil
+}
+
+// TestFIFO_MaintenanceNoGroupRejects verifies a request for a maintenance model
+// with no fuzzy group is rejected at admission.
+func TestFIFO_MaintenanceNoGroupRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["z"] = process.StateStopped
+	eff.maintenance["z"] = true
+	s := newFIFO(&stubPlanner{}, eff)
+
+	r := req("z")
+	s.OnRequest(r)
+	if err := admitErr(t, r); !errors.Is(err, swaputil.ErrMaintenance) {
+		t.Fatalf("admit err=%v want ErrMaintenance", err)
+	}
+	if eff.startsFor("z") != 0 {
+		t.Errorf("startSwap(z) called %d times, want 0", eff.startsFor("z"))
+	}
+}
+
+// TestFIFO_MaintenanceSubstituteToOnline verifies a request for a maintenance
+// model in a fuzzy group with an online member is served by that member.
+func TestFIFO_MaintenanceSubstituteToOnline(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.maintenance["z"] = true
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "z": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	r := reqMeta("z")
+	s.OnRequest(r)
+	if err := admitErr(t, r); err != nil {
+		t.Fatalf("admit err=%v want nil", err)
+	}
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("served model=%q want a (maintenance z served by online a)", eff.lastServeReq.Model)
+	}
+}
+
+// TestFIFO_MaintenanceSubstituteNoOnlineRejects verifies a request for a
+// maintenance model in a fuzzy group with no online member is rejected.
+func TestFIFO_MaintenanceSubstituteNoOnlineRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["z"] = process.StateStopped
+	eff.maintenance["z"] = true
+	gf := groupFuzzy{groupOf: map[string]string{"z": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	s := newFIFOFuzzy(&stubPlanner{}, eff, gf, nil)
+
+	r := req("z")
+	s.OnRequest(r)
+	if err := admitErr(t, r); !errors.Is(err, swaputil.ErrMaintenance) {
+		t.Fatalf("admit err=%v want ErrMaintenance", err)
+	}
+}
+
+// TestFIFO_PinProtectionReject verifies a request that would evict a pinned
+// model outside its fuzzy group is rejected at admission.
+func TestFIFO_PinProtectionReject(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.pinned["a"] = true
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFO(planner, eff)
+
+	r := req("z")
+	s.OnRequest(r)
+	if err := admitErr(t, r); !errors.Is(err, swaputil.ErrPinnedProtected) {
+		t.Fatalf("admit err=%v want ErrPinnedProtected", err)
+	}
+	if eff.startsFor("z") != 0 {
+		t.Errorf("startSwap(z) called %d times, want 0", eff.startsFor("z"))
+	}
+}
+
+// TestFIFO_PinProtectionRewriteSameGroup verifies a request that would evict a
+// pinned model in the same fuzzy group is rewritten to serve that pinned model.
+func TestFIFO_PinProtectionRewriteSameGroup(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.pinned["a"] = true
+	gf := groupFuzzy{groupOf: map[string]string{"a": "g", "z": "g"}, idleTimeout: map[string]time.Duration{"g": 300 * time.Second}}
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFOFuzzy(planner, eff, gf, nil)
+
+	r := reqMeta("z")
+	s.OnRequest(r)
+	if err := admitErr(t, r); err != nil {
+		t.Fatalf("admit err=%v want nil", err)
+	}
+	if eff.lastServeReq.Model != "a" {
+		t.Errorf("served model=%q want a (pinned a protected)", eff.lastServeReq.Model)
+	}
+}
+
+// TestFIFO_DrainQueue_MaintenanceRejects verifies drainQueue rejects a queued
+// request for a maintenance model with ErrMaintenance.
+func TestFIFO_DrainQueue_MaintenanceRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.maintenance["a"] = true
+	s := newFIFO(&stubPlanner{}, eff)
+
+	r := reqCh("a")
+	s.admit(r)
+	s.enqueue(r)
+	s.drainQueue()
+	if err := grantErrorFor(eff, "a"); !errors.Is(err, swaputil.ErrMaintenance) {
+		t.Fatalf("queued request err=%v want ErrMaintenance", err)
+	}
+}
+
+// TestFIFO_DrainQueue_PinnedEvictRejects verifies drainQueue rejects (never
+// rewrites) a queued request whose serving would evict a pinned model.
+func TestFIFO_DrainQueue_PinnedEvictRejects(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["z"] = process.StateStopped
+	eff.pinned["a"] = true
+	planner := &stubPlanner{evict: map[string][]string{"z": {"a"}}}
+	s := newFIFO(planner, eff)
+
+	r := reqCh("z")
+	s.admit(r)
+	s.enqueue(r)
+	s.drainQueue()
+	if err := grantErrorFor(eff, "z"); !errors.Is(err, swaputil.ErrPinnedProtected) {
+		t.Fatalf("queued request err=%v want ErrPinnedProtected", err)
 	}
 }

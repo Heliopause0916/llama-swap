@@ -48,6 +48,10 @@ type apiModel struct {
 	// the UI's Model.modalities so the SSE feed and the OpenAI listing agree.
 	// Nil for peers and models without declared or discovered modalities.
 	Modalities *apiModalities `json:"modalities,omitempty"`
+	// Pinned reports whether the model is pinned (never TTL-unloaded/evicted).
+	Pinned bool `json:"pinned"`
+	// Maintenance reports whether the model is under maintenance (never started).
+	Maintenance bool `json:"maintenance"`
 }
 
 type apiModalities struct {
@@ -178,6 +182,8 @@ func (s *Server) modelStatus() []apiModel {
 			UptimeMs:        uptimeMs,
 			LoadingProgress: loading.Progress,
 			LoadingMessage:  loading.Message,
+			Pinned:          s.local.IsPinned(id),
+			Maintenance:     s.local.IsMaintenance(id),
 		})
 	}
 
@@ -212,6 +218,67 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 	s.local.Unload(0, realName)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+// resolveLocalModel resolves a {model...} path value to a real local model ID,
+// writing a 404 response when the model is unknown or not local.
+func (s *Server) resolveLocalModel(w http.ResponseWriter, r *http.Request) (string, bool) {
+	requested := strings.TrimPrefix(r.PathValue("model"), "/")
+	realName, found := s.cfg.RealModelName(requested)
+	if !found {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return "", false
+	}
+	if !s.local.Handles(realName) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return "", false
+	}
+	return realName, true
+}
+
+func writeModelState(w http.ResponseWriter, state map[string]bool) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(state)
+}
+
+func (s *Server) handleAPIPinModel(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.resolveLocalModel(w, r)
+	if !ok {
+		return
+	}
+	s.local.PinModel(id)
+	event.Emit(swaputil.ModelPinStateEvent{ModelID: id})
+	writeModelState(w, map[string]bool{"pinned": true})
+}
+
+func (s *Server) handleAPIUnpinModel(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.resolveLocalModel(w, r)
+	if !ok {
+		return
+	}
+	s.local.UnpinModel(id)
+	event.Emit(swaputil.ModelPinStateEvent{ModelID: id})
+	writeModelState(w, map[string]bool{"pinned": false})
+}
+
+func (s *Server) handleAPISetMaintenance(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.resolveLocalModel(w, r)
+	if !ok {
+		return
+	}
+	s.local.SetMaintenance(id, true)
+	event.Emit(swaputil.ModelPinStateEvent{ModelID: id})
+	writeModelState(w, map[string]bool{"maintenance": true})
+}
+
+func (s *Server) handleAPIUnmaintenance(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.resolveLocalModel(w, r)
+	if !ok {
+		return
+	}
+	s.local.SetMaintenance(id, false)
+	event.Emit(swaputil.ModelPinStateEvent{ModelID: id})
+	writeModelState(w, map[string]bool{"maintenance": false})
 }
 
 // handleAPIActivity serves paginated activity table rows.
@@ -740,6 +807,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			event.On(func(e ActivityLogEvent) { sendActivity(e.Metrics.ID) }),
 			event.On(func(e swaputil.InFlightRequestsEvent) { sendInFlight(e) }),
 			event.On(func(e swaputil.InferencePausedEvent) { sendPause() }),
+			event.On(func(e swaputil.ModelPinStateEvent) { sendModels() }),
 		}
 
 		// initial payload

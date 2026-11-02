@@ -50,6 +50,8 @@ var (
 	ErrNoPeerModelFound  = fmt.Errorf("peer model not found")
 	ErrNoLocalModelFound = fmt.Errorf("local model not found")
 	ErrInferencePaused   = fmt.Errorf("all inference is paused")
+	ErrPinnedProtected   = fmt.Errorf("request would unload a pinned model")
+	ErrMaintenance       = fmt.Errorf("model is under maintenance")
 )
 
 // IsWebSocketUpgrade reports whether r contains a valid websocket protocol
@@ -211,6 +213,10 @@ func SendError(w http.ResponseWriter, r *http.Request, err error) {
 		SendResponse(w, r, http.StatusNotFound, "no router for requested model")
 	case errors.Is(err, ErrInferencePaused):
 		SendResponse(w, r, http.StatusServiceUnavailable, ErrInferencePaused.Error())
+	case errors.Is(err, ErrPinnedProtected):
+		SendResponse(w, r, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrMaintenance):
+		SendResponse(w, r, http.StatusServiceUnavailable, err.Error())
 	default:
 		SendResponse(w, r, http.StatusInternalServerError, fmt.Sprintf("unspecific error: %v", err))
 	}

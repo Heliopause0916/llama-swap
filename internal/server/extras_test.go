@@ -279,6 +279,109 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 	})
 }
 
+func TestServer_HandleAPIPinModel(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+
+	t.Run("pin sets state and reports pinned", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/pin/m1", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if !local.IsPinned("m1") {
+			t.Error("IsPinned(m1) = false, want true")
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(`"pinned":true`)) {
+			t.Errorf("body = %s, want pinned:true", w.Body.String())
+		}
+	})
+
+	t.Run("unpin clears state and reports unpinned", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/unpin/m1", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if local.IsPinned("m1") {
+			t.Error("IsPinned(m1) = true, want false")
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(`"pinned":false`)) {
+			t.Errorf("body = %s, want pinned:false", w.Body.String())
+		}
+	})
+
+	t.Run("unknown model 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/pin/nope", nil))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+}
+
+func TestServer_HandleAPIMaintenance(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+
+	t.Run("enter maintenance sets state and reports maintenance", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/maintenance/m1", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if !local.IsMaintenance("m1") {
+			t.Error("IsMaintenance(m1) = false, want true")
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(`"maintenance":true`)) {
+			t.Errorf("body = %s, want maintenance:true", w.Body.String())
+		}
+	})
+
+	t.Run("exit maintenance clears state and reports resumed", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/unmaintenance/m1", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if local.IsMaintenance("m1") {
+			t.Error("IsMaintenance(m1) = true, want false")
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(`"maintenance":false`)) {
+			t.Errorf("body = %s, want maintenance:false", w.Body.String())
+		}
+	})
+
+	t.Run("unknown model 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/maintenance/nope", nil))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+}
+
+func TestServer_ModelStatusReportsPinMaintenance(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "")
+	local.pins = map[string]bool{"m1": true}
+	local.maintenance = map[string]bool{"m1": true}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+
+	models := s.modelStatus()
+	if len(models) != 1 {
+		t.Fatalf("modelStatus len = %d, want 1", len(models))
+	}
+	if !models[0].Pinned {
+		t.Error("Pinned = false, want true")
+	}
+	if !models[0].Maintenance {
+		t.Error("Maintenance = false, want true")
+	}
+}
+
 func TestServer_HandleAPICapture(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.metrics = newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
